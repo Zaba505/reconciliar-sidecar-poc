@@ -9,6 +9,137 @@ The POC set out to answer two questions:
 1. **Does the design hold?** Yes. It passes the full end-to-end suite of PLAN.md §8.4, run against the container image. Its output is identical under tiny and huge memory budgets, at every bucket count and parallelism tested.
 2. **Can Go keep to a memory budget?** Yes, but only with `GOMEMLIMIT` set. See [Performance](#performance).
 
+## High-level design
+
+The sidecar runs next to your application, in the same pod. Your application streams records for a left and a right side into a **run**, seals it, then streams back the reconciled results. The sidecar never holds more than its memory budget. Anything that doesn't fit goes to spill files in its data directory, and the join reads it back one slice at a time.
+
+### Components
+
+```mermaid
+flowchart LR
+  App["Your application<br/>(gRPC client)"]
+  Probe["kubelet<br/>startup / readiness probe"]
+
+  subgraph Sidecar["recon-sidecar container"]
+    API["gRPC API<br/>recon.v1, TLS :7443<br/><i>validation, state checks,<br/>error mapping</i>"]
+    Health["Health<br/>grpc.health.v1 :8081"]
+    Runs["Run manager<br/><i>run IDs, OPEN / SEALED / FAILED,<br/>Seal totals, limits</i>"]
+
+    subgraph Run["Per run"]
+      Buckets["Partitions<br/>left and right × N hash buckets<br/>+ empty-key buffers<br/><i>chunked, already in spill format</i>"]
+    end
+
+    Pool["Memory pool<br/><i>one budget for every run;<br/>spills the largest buffers<br/>when a reservation fails</i>"]
+
+    subgraph Join["Join engine"]
+      Planner["Planner<br/><i>groups buckets into units<br/>that fit budget / parallelism</i>"]
+      Workers["Workers × parallelism<br/><i>load unit → sort by hash, key →<br/>emit left_only / right_only / both</i>"]
+      Sender["Single sender<br/><i>one gRPC send at a time;<br/>flow control = backpressure</i>"]
+    end
+
+    Disk[("Data directory<br/>runs/&lt;id&gt;/&lt;side&gt;/&lt;bucket&gt;/*.rec<br/><i>disk limit enforced</i>")]
+  end
+
+  App -- "CreateRun, Ingest, SealRun,<br/>Join, DeleteRun" --> API
+  Probe --> Health
+  API --> Runs
+  Runs -- "Ingest: append records" --> Buckets
+  Buckets -- "reserve chunks" --> Pool
+  Pool -. "spill largest buffers" .-> Disk
+  Runs -- "Join" --> Planner
+  Planner --> Workers
+  Workers -- "reserve unit working set" --> Pool
+  Disk -- "read spilled records" --> Workers
+  Buckets -- "pinned in-memory chunks" --> Workers
+  Workers -- "result batches" --> Sender
+  Sender -- "JoinResponse stream" --> App
+```
+
+| Component | Code | Job |
+|---|---|---|
+| gRPC API | `internal/api` | Validates every request, checks the run's state, and maps every failure to a gRPC code plus a `ReconError` detail |
+| Run manager | `internal/run` | Creates runs with UUIDv7 IDs, enforces `RECON_MAX_RUNS`, tracks each run's state and its per-side record totals, and cancels a run's streams on DeleteRun |
+| Partitions and buffers | `internal/buffer` | Hashes each non-empty key with XXH3 and appends the record to bucket `hash % N` for its side. Buffers are lists of chunks (4 KiB doubling to 1 MiB) already in spill-file encoding, so a spill is one sequential write |
+| Memory pool | `internal/mem` | Holds the single memory budget. Every chunk, decoded message, join unit and output batch reserves before it allocates. When a reservation doesn't fit, the goroutine asking for memory spills the largest unpinned buffers (of any run) to 80% of the budget and retries once. There is no background work |
+| Spill files | `internal/spill` | Writes and tracks spill files against `RECON_DISK_LIMIT_BYTES`, and empties the data directory at startup |
+| Join engine | `internal/join` | Plans units, runs them in parallel, handles skew, streams results through a single sender, and checks control totals |
+
+### Lifecycle of a run
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant App as Your application
+  participant API as Sidecar API
+  participant Pool as Memory pool
+  participant Disk as Spill files
+  participant Join as Join engine
+
+  App->>API: CreateRun(bucket_count N)
+  API-->>App: run_id (OPEN)
+
+  par one or more Ingest streams, both sides mixed
+    loop each batch (about 1 MiB)
+      App->>API: IngestRequest(run_id, side, records)
+      API->>Pool: reserve message + chunks
+      opt budget full
+        Pool->>Disk: spill largest buffers
+      end
+      Note over API: records appended to bucket hash(key) % N
+    end
+    App->>API: close stream
+    API-->>App: IngestResponse (stream's counts committed)
+  end
+
+  App->>API: SealRun(run_id)
+  API-->>App: per-side totals (SEALED, now read-only)
+
+  App->>API: Join(run_id, states filter)
+  API->>Join: plan units from bucket sizes
+  loop each unit, up to RECON_JOIN_PARALLELISM at once
+    Join->>Pool: reserve unit working set
+    Join->>Disk: read the unit's spill files
+    Note over Join: sort by (hash, key, side), then one pass<br/>emits left_only / right_only / both
+    Join-->>App: JoinResponse batches (single sender)
+  end
+  Note over Join: joined counts must equal Seal totals
+  API-->>App: stream ends OK (or INTERNAL on a mismatch)
+
+  opt Join again
+    App->>API: Join(run_id) gives the same results
+  end
+
+  App->>API: DeleteRun(run_id)
+  API->>Disk: remove the run's directory
+  API-->>App: OK
+```
+
+### Run states
+
+```mermaid
+stateDiagram-v2
+  [*] --> OPEN: CreateRun
+  OPEN --> OPEN: Ingest stream commits
+  OPEN --> SEALED: SealRun (no stream open)
+  OPEN --> FAILED: stream ends uncommitted after records were accepted, or DISK_EXHAUSTED
+  SEALED --> SEALED: Join (repeatable, read-only)
+  OPEN --> [*]: DeleteRun
+  SEALED --> [*]: DeleteRun
+  FAILED --> [*]: DeleteRun
+```
+
+A Join that fails, for example with `HOT_KEY` or a cancelled client, leaves the run `SEALED`, so it can be retried. A `FAILED` run can only be deleted.
+
+### How the join works
+
+- **Partitioning.** At ingest, every record with a non-empty key goes to bucket `xxh3(key) % N` for its side, so a key's left and right records always land in the same bucket number.
+- **Planning.** At Join time, the planner estimates each bucket's working set as its record bytes times 2, and groups neighbouring buckets into **units** that fit in `budget / parallelism`. Small buckets are coalesced into one unit, and the plan depends only on the data, not on timing.
+- **Joining a unit.** A worker reserves the unit's memory, pins its in-memory chunks so they can't be spilled from under it, and reads its spill files. It builds a 16-byte index entry per record, sorts the entries by (hash, key, side), and walks them once. A key with records on only one side is `left_only` or `right_only`, and a key with both is `both`. No hash map is needed, and the output order is deterministic.
+- **Skew.** If a single bucket is too big for a unit, the worker counts records per hash. If one key alone is too big for the budget or for `RECON_MAX_MATCH_BYTES`, the Join fails with `HOT_KEY`, naming the key and its per-side counts. Otherwise it re-partitions the bucket with a new seed into a scratch directory (`runs/<id>/join-<n>/`), up to 3 levels deep, and removes the scratch directory when the Join ends.
+- **Empty keys** never match one another. They are streamed back as one-sided results without sorting.
+- **Output and backpressure.** Workers hand finished batches to a single sender, because gRPC allows one send at a time per stream. When your application reads slowly, gRPC flow control blocks the sender, which blocks the workers, so memory stays within budget.
+- **Control totals.** The engine counts every record it joined on each side, including results removed by the `states` filter. The stream ends `OK` only if those counts equal the totals returned by SealRun.
+
 ## Repository layout
 
 ```
