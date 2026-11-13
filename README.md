@@ -115,15 +115,20 @@ Measured on an AMD Ryzen 9 5950X (32 CPUs, 31 GB RAM, NVMe, Fedora 44) under roo
 
 ### Throughput
 
-| Scenario | Data | Ingest | Join | Disk peak |
-|---|---|---|---|---|
-| 1 GiB, 128 MiB budget | 1.05 M records | 187–227 MiB/s | 394–419 MiB/s | 991 MiB |
-| 1 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 1.05 M records | 308 MiB/s | 472 MiB/s | 906 MiB |
-| 10 GiB, 128 MiB budget | 10.5 M records | 225–227 MiB/s | 461–536 MiB/s | 10.0 GiB |
-| 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 10.5 M records | 283 MiB/s | 460 MiB/s | 9.9 GiB |
-| 275 MiB of small records, 128 MiB budget | 6.0 M records | 152–154 MiB/s | 134–137 MiB/s | 303 MiB |
+| Scenario | Records | Ingest | Join | Ingest + join | Disk peak |
+|---|---|---|---|---|---|
+| 1 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 1.05 M | 5.4 s (187 MiB/s) | 2.6 s (394 MiB/s) | 8.0 s | 991 MiB |
+| 1 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 1.05 M | 4.5 s (227 MiB/s) | 2.4 s (419 MiB/s) | 6.9 s | 991 MiB |
+| 1 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 1.05 M | 3.3 s (308 MiB/s) | 2.2 s (472 MiB/s) | 5.5 s | 906 MiB |
+| 10 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 10.5 M | 44.9 s (227 MiB/s) | 19.0 s (536 MiB/s) | 63.9 s | 10,234 MiB |
+| 10 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 10.5 M | 45.3 s (225 MiB/s) | 22.1 s (461 MiB/s) | 67.4 s | 10,242 MiB |
+| 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 10.5 M | 36.0 s (283 MiB/s) | 22.1 s (460 MiB/s) | 58.1 s | 10,175 MiB |
+| 275 MiB of small records, 128 MiB budget, `GOMEMLIMIT` unset | 6.0 M | 1.8 s (152 MiB/s) | 2.0 s (137 MiB/s) | 3.8 s | 303 MiB |
+| 275 MiB of small records, 128 MiB budget, `GOMEMLIMIT` 90% | 6.0 M | 1.8 s (154 MiB/s) | 2.1 s (134 MiB/s) | 3.9 s | 301 MiB |
 
-Throughput is key and value bytes over wall-clock time as the client saw it. The client generated and verified the data on the same machine, so these numbers are lower bounds for the sidecar. With small records the cost per record dominates, at about 3 M records/s. Spill files are uncompressed, so disk use is about 1× the data for 1 KB values.
+Times are wall-clock as the client saw them, and throughput is key and value bytes over that time. Ingest + join is the sidecar's share of a run. SealRun, which runs between the two, wasn't timed, and neither were CreateRun and DeleteRun. The client generated the data and verified every result on the same machine, and the join time includes that verification, so these times are upper bounds for the sidecar. With small records the cost per record dominates, at about 3 M records/s. Spill files are uncompressed, so disk use is about 1× the data for 1 KB values.
+
+In a real pipeline, reading the source can overlap with Ingest, and processing results can overlap with Join, because both stream in batches. Each step then takes about as long as the slower of the two sides.
 
 ### Memory
 
