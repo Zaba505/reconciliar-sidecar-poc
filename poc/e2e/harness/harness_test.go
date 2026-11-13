@@ -1,6 +1,10 @@
 package harness
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParseMemUsage(t *testing.T) {
 	cases := map[string]int64{
@@ -43,5 +47,23 @@ func TestReservePorts(t *testing.T) {
 	defer ports.mu.Unlock()
 	if ports.held[got[0]] || !ports.held[got[1]] {
 		t.Errorf("after releasing %d: held[%d] = %t, held[%d] = %t; want false, true", got[0], got[0], ports.held[got[0]], got[1], ports.held[got[1]])
+	}
+}
+
+func TestDataRoot(t *testing.T) {
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for env, want := range map[string]string{
+		"":             defaultDataRoot,
+		"/mnt/x":       "/mnt/x",
+		"data":         filepath.Join(wd, "data"), // a relative source would name a volume
+		"./data/runs/": filepath.Join(wd, "data/runs"),
+	} {
+		t.Setenv("RECON_E2E_DATA_ROOT", env)
+		if got, err := dataRoot(); err != nil || got != want {
+			t.Errorf("RECON_E2E_DATA_ROOT=%q: dataRoot() = %q, %v; want %q", env, got, err, want)
+		}
 	}
 }
