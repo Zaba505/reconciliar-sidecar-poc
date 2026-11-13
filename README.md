@@ -16,43 +16,35 @@ The sidecar runs next to your application, in the same pod. Your application str
 ### Components
 
 ```mermaid
-flowchart LR
-  App["Your application<br/>(gRPC client)"]
-  Probe["kubelet<br/>startup / readiness probe"]
+flowchart TB
+  App(["Your application"])
 
   subgraph Sidecar["recon-sidecar container"]
-    API["gRPC API<br/>recon.v1, TLS :7443<br/><i>validation, state checks,<br/>error mapping</i>"]
-    Health["Health<br/>grpc.health.v1 :8081"]
-    Runs["Run manager<br/><i>run IDs, OPEN / SEALED / FAILED,<br/>Seal totals, limits</i>"]
-
-    subgraph Run["Per run"]
-      Buckets["Partitions<br/>left and right × N hash buckets<br/>+ empty-key buffers<br/><i>chunked, already in spill format</i>"]
-    end
-
-    Pool["Memory pool<br/><i>one budget for every run;<br/>spills the largest buffers<br/>when a reservation fails</i>"]
-
-    subgraph Join["Join engine"]
-      Planner["Planner<br/><i>groups buckets into units<br/>that fit budget / parallelism</i>"]
-      Workers["Workers × parallelism<br/><i>load unit → sort by hash, key →<br/>emit left_only / right_only / both</i>"]
-      Sender["Single sender<br/><i>one gRPC send at a time;<br/>flow control = backpressure</i>"]
-    end
-
-    Disk[("Data directory<br/>runs/&lt;id&gt;/&lt;side&gt;/&lt;bucket&gt;/*.rec<br/><i>disk limit enforced</i>")]
+    API["gRPC API<br/>TLS :7443"]
+    Runs["Run manager"]
+    Buckets["Hash buckets<br/>left / right"]
+    Join["Join engine"]
+    Pool["Memory pool<br/>one budget"]
+    Disk[("Spill files")]
   end
 
-  App -- "CreateRun, Ingest, SealRun,<br/>Join, DeleteRun" --> API
-  Probe --> Health
+  App -- "CreateRun · Ingest<br/>SealRun · Join · DeleteRun" --> API
   API --> Runs
-  Runs -- "Ingest: append records" --> Buckets
-  Buckets -- "reserve chunks" --> Pool
-  Pool -. "spill largest buffers" .-> Disk
-  Runs -- "Join" --> Planner
-  Planner --> Workers
-  Workers -- "reserve unit working set" --> Pool
-  Disk -- "read spilled records" --> Workers
-  Buckets -- "pinned in-memory chunks" --> Workers
-  Workers -- "result batches" --> Sender
-  Sender -- "JoinResponse stream" --> App
+  Runs -- "Ingest" --> Buckets
+  Runs -- "Join" --> Join
+  Buckets -- "reserve" --> Pool
+  Join -- "reserve" --> Pool
+  Join -- "read" --> Buckets
+  Pool -. "spill when full" .-> Disk
+  Join -- "read" --> Disk
+  Join == "results" ==> App
+```
+
+Inside the join engine:
+
+```mermaid
+flowchart LR
+  Planner["Planner<br/>buckets → units"] --> Workers["Workers<br/>× parallelism"] --> Sender["Single<br/>sender"] --> Client(["Your application"])
 ```
 
 | Component | Code | Job |
@@ -63,6 +55,7 @@ flowchart LR
 | Memory pool | `internal/mem` | Holds the single memory budget. Every chunk, decoded message, join unit and output batch reserves before it allocates. When a reservation doesn't fit, the goroutine asking for memory spills the largest unpinned buffers (of any run) to 80% of the budget and retries once. There is no background work |
 | Spill files | `internal/spill` | Writes and tracks spill files against `RECON_DISK_LIMIT_BYTES`, and empties the data directory at startup |
 | Join engine | `internal/join` | Plans units, runs them in parallel, handles skew, streams results through a single sender, and checks control totals |
+| Health | `grpchealth` (humus) | Serves `grpc.health.v1` in plaintext on `:8081` for the startup and readiness probes |
 
 ### Lifecycle of a run
 
