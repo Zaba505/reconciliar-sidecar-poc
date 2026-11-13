@@ -133,6 +133,55 @@ A Join that fails, for example with `HOT_KEY` or a cancelled client, leaves the 
 - **Output and backpressure.** Workers hand finished batches to a single sender, because gRPC allows one send at a time per stream. When your application reads slowly, gRPC flow control blocks the sender, which blocks the workers, so memory stays within budget.
 - **Control totals.** The engine counts every record it joined on each side, including results removed by the `states` filter. The stream ends `OK` only if those counts equal the totals returned by SealRun.
 
+### Memory and spilling
+
+The sidecar has one memory pool with one budget (`RECON_MEMORY_LIMIT_BYTES`), shared by every run. Everything that takes real memory reserves from the pool before it allocates, and releases afterwards:
+
+| What reserves | Released | Can the pool spill it? |
+|---|---|---|
+| An Ingest message, once decoded | As soon as its records are copied into buckets | No, but it lasts one message |
+| Bucket chunks (the run's records) | When the buffer is spilled, or on DeleteRun. Not when Ingest or Seal finishes | **Yes**, unless a running Join has pinned it |
+| A join unit's working set: its spill files read back, plus a 16-byte index entry per record | When the unit's results have been sent | No |
+| Join output batches, one per worker | When the Join ends | No |
+| Per-key counters while scanning an oversized bucket for hot keys | When the scan ends | No |
+
+When a reservation doesn't fit, the goroutine that asked for it frees memory itself. There is no background spiller:
+
+```mermaid
+flowchart TB
+  R["Reserve n bytes"] --> F{"Fits in<br/>the budget?"}
+  F -- yes --> OK(["Reserved"])
+  F -- no --> S["Spill the largest unpinned buffers,<br/>from any run, to disk until usage<br/>is at most 80% of the budget"]
+  S --> F2{"Fits now?"}
+  F2 -- yes --> OK
+  F2 -- no --> E(["MEMORY_EXHAUSTED"])
+```
+
+**During Ingest,** bucket chunks fill the pool. Once it is full, each new chunk forces a spill down to 80%, so the pool stays between about 80% and 100% full and everything beyond that goes to disk. In the 10 GiB run with a 128 MiB budget, the pool never went above 128 MiB, and 10.2 GiB was on disk by Seal.
+
+**After Ingest,** the chunks that weren't spilled stay in memory and stay reserved, even after Seal. This isn't a leak: they are unpinned, so the pool can spill them whenever something else needs room. Delete runs when you are done with them, because only DeleteRun gives back their memory and their disk.
+
+**At Join time,** the pool is usually still full of ingest chunks. The Join gets its memory the same way Ingest does: its reservations force those chunks to disk. If the chunks in the way belong to the unit it is about to join, the worker unpins them, reserves as if all the unit's records were on disk (which may spill them), then pins them again and reads them back. While a unit is being joined, its buffers are pinned, so nothing can spill them out from under it.
+
+**The pool runs out** only when the memory that can't be spilled leaves no room: pinned buffers, units being joined, output batches and in-flight messages. In practice that means two Joins at once, a Join next to another run's heavy Ingest, or an Ingest message larger than the budget. The request then fails with `MEMORY_EXHAUSTED` instead of the container being OOM-killed.
+
+#### Sizing: more memory means less spilling
+
+Because the pool works as a cache in front of disk, a bigger budget changes how much is spilled and how fast Ingest runs, not just whether the sidecar survives. These are measured runs with `GOMEMLIMIT` at 90% of the container limit (see [Performance](#performance)):
+
+| Data | Budget | Ingest | Join | Spill files at Seal | Spilled at Seal |
+|---|---|---|---|---|---|
+| 1 GiB | 128 MiB | 4.5 s | 2.4 s | 13,704 | 949 MiB |
+| 1 GiB | 358 MiB | 3.3 s | 2.2 s | 4,180 | 818 MiB |
+| 10 GiB | 128 MiB | 45.3 s | 22.1 s | 146,533 | 10,215 MiB |
+| 10 GiB | 358 MiB | 36.0 s | 22.1 s | 49,633 | 10,077 MiB |
+
+- **Ingest got 20 to 27% faster** with about 2.8 times the budget, and wrote about a third as many spill files. Each spill frees about 20% of the budget at once, so a bigger budget means fewer, larger writes.
+- **The Join barely changed** in these runs, because with data 30 to 80 times the budget almost all of it has to be read back from disk either way. A bigger budget does give each unit more room (`budget / parallelism`), so fewer, larger units are planned.
+- **A run that fits within the budget doesn't spill at all.** That case wasn't measured.
+- **Raise three things together:** the container's memory limit, the budget (by default 70% of that limit) and `GOMEMLIMIT` (about 90% of it). Raising the budget without `GOMEMLIMIT` gets the container OOM-killed. Raising the container limit alone does nothing unless the budget follows it, which it does by default.
+- **On slow or network-attached disks, the number of files may matter more than the bytes.** Spilling largest first across 2 × N buffers produces many small files: about 70 KiB each in the 10 GiB, 128 MiB run. A larger budget or a smaller `bucket_count` gives fewer, larger files.
+
 ## Repository layout
 
 ```
