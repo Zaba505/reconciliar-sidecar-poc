@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "files": [
+    "avro/bankline/bank_line.go",
+    "avro/cardsettlement/card_settlement.go",
+    "avro/envelope/envelope.go",
+    "avro/kitchensink/kitchen_sink.go",
+    "avro/payment/payment.go",
+    "avro/tiny/tiny.go"
+  ]
+}

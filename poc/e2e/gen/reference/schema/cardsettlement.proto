@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package gen.cardsettlement;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "poc/e2e/gen/reference/pb/cardsettlement";
+
+message Money {
+  string currency_code = 1;
+  int64 units = 2;
+  int32 nanos = 3;
+}
+
+message Date {
+  int32 year = 1;
+  int32 month = 2;
+  int32 day = 3;
+}
+
+enum EntryMode {
+  ENTRY_MODE_UNSPECIFIED = 0;
+  ENTRY_MODE_CHIP = 1;
+  ENTRY_MODE_CONTACTLESS = 2;
+  ENTRY_MODE_ECOM = 3;
+  ENTRY_MODE_SWIPE = 4;
+  ENTRY_MODE_MANUAL = 5;
+}
+
+enum Network {
+  NETWORK_UNSPECIFIED = 0;
+  NETWORK_VISA = 1;
+  NETWORK_MASTERCARD = 2;
+  NETWORK_AMEX = 3;
+  NETWORK_DISCOVER = 4;
+}
+
+message CardSettlement {
+  fixed64 id = 1;
+  string key = 2;
+  int64 merchant_id = 3;
+  string terminal_id = 4;
+  int32 card_bin = 5;
+  string card_last4 = 6;
+  string auth_code = 7;
+  Money amount = 8;
+  Money interchange_fee = 9;
+  google.protobuf.Timestamp txn_time = 10;
+  Date settle_date = 11;
+  int32 mcc = 12;
+  EntryMode entry_mode = 13;
+  Network network = 14;
+  string arn = 15;
+}

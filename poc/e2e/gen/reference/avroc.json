@@ -1,0 +1,64 @@
+{
+  "generators": [
+    {
+      "name": "go",
+      "out": "avro/payment",
+      "inputs": [
+        "schema/payment.avdl"
+      ],
+      "options": {
+        "package_name": "payment"
+      }
+    },
+    {
+      "name": "go",
+      "out": "avro/bankline",
+      "inputs": [
+        "schema/bankline.avdl"
+      ],
+      "options": {
+        "package_name": "bankline"
+      }
+    },
+    {
+      "name": "go",
+      "out": "avro/cardsettlement",
+      "inputs": [
+        "schema/cardsettlement.avdl"
+      ],
+      "options": {
+        "package_name": "cardsettlement"
+      }
+    },
+    {
+      "name": "go",
+      "out": "avro/envelope",
+      "inputs": [
+        "schema/envelope.avdl"
+      ],
+      "options": {
+        "package_name": "envelope"
+      }
+    },
+    {
+      "name": "go",
+      "out": "avro/tiny",
+      "inputs": [
+        "schema/tiny.avdl"
+      ],
+      "options": {
+        "package_name": "tiny"
+      }
+    },
+    {
+      "name": "go",
+      "out": "avro/kitchensink",
+      "inputs": [
+        "schema/kitchensink.avdl"
+      ],
+      "options": {
+        "package_name": "kitchensink"
+      }
+    }
+  ]
+}

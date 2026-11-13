@@ -1,0 +1,101 @@
+namespace gen.payment;
+
+schema Payment;
+
+fixed Id(8);
+
+enum Country {
+  GB,
+  DE,
+  FR,
+  NL,
+  ES,
+  IT,
+  BE,
+  IE,
+  US,
+  CH
+}
+
+record Party {
+  string name;
+  string account;
+  union { null, string } bic;
+  Country country;
+}
+
+enum PaymentType {
+  PAYMENT,
+  TRANSFER,
+  CARD,
+  FEE,
+  FX,
+  REFUND,
+  INTEREST
+}
+
+enum Direction {
+  DEBIT,
+  CREDIT
+}
+
+record Money {
+  string currency_code;
+  bytes amount;
+}
+
+enum PaymentStatus {
+  SETTLED,
+  PENDING,
+  REVERSED,
+  FAILED
+}
+
+enum Channel {
+  API,
+  BATCH,
+  SWIFT,
+  SEPA,
+  ACH,
+  CARD_NETWORK
+}
+
+enum FeeKind {
+  WIRE_FEE,
+  FX_FEE,
+  SERVICE_FEE
+}
+
+record Fee {
+  FeeKind kind;
+  Money amount;
+}
+
+record KeyValue {
+  string key;
+  string value;
+}
+
+record Payment {
+  Id id;
+  string payment_ref;
+  string account_id;
+  Party counterparty;
+  PaymentType type;
+  Direction direction;
+  Money amount;
+  union { null, double } fx_rate;
+  long booked_at;
+  int value_date;
+  PaymentStatus status;
+  Channel channel;
+  union { null, string } end_to_end_id;
+  long batch_id;
+  union { null, string } memo;
+  string created_by;
+  int version;
+  boolean reconciled;
+  array<string> tags;
+  array<Fee> fees;
+  array<KeyValue> metadata;
+}

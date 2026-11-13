@@ -26,6 +26,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -52,10 +53,11 @@ const (
 	samplePeriod     = 500 * time.Millisecond
 	defaultMemory    = "1g"
 	startAttempts    = 5
-	// dataRoot holds the containers' data directories. It must not be a
-	// tmpfs, whose pages are charged to the container's memory cgroup
-	// (§6.3), and /tmp often is.
-	dataRoot = "/var/tmp"
+	// defaultDataRoot holds the containers' data directories unless
+	// RECON_E2E_DATA_ROOT names another. A data root must not be a tmpfs,
+	// whose pages are charged to the container's memory cgroup (§6.3), and
+	// /tmp often is.
+	defaultDataRoot = "/var/tmp"
 )
 
 // env is what Main sets up for every test in the package.
@@ -69,9 +71,10 @@ var env struct {
 
 // Main sets up the harness, runs the tests and cleans up, returning the
 // exit code for os.Exit. It reads the engine from RECON_E2E_ENGINE (podman
-// or docker by default) and the image from RECON_E2E_IMAGE
-// (recon-sidecar:dev by default), and generates the TLS certificates every
-// container is given.
+// or docker by default), the image from RECON_E2E_IMAGE
+// (recon-sidecar:dev by default) and the directory to make the containers'
+// data directories in from RECON_E2E_DATA_ROOT (/var/tmp by default), and
+// generates the TLS certificates every container is given.
 func Main(m *testing.M) int {
 	env.engine = os.Getenv("RECON_E2E_ENGINE")
 	if env.engine == "" {
@@ -107,17 +110,34 @@ func Main(m *testing.M) int {
 		fmt.Fprintln(os.Stderr, "harness:", err)
 		return 1
 	}
-	if env.data, err = os.MkdirTemp(dataRoot, "recon-e2e-data-"); err != nil {
+	root, err := dataRoot()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "harness:", err)
+		return 1
+	}
+	if env.data, err = os.MkdirTemp(root, "recon-e2e-data-"); err != nil {
 		fmt.Fprintln(os.Stderr, "harness:", err)
 		return 1
 	}
 	defer func() { _ = os.RemoveAll(env.data) }()
 	var st unix.Statfs_t
 	if err := unix.Statfs(env.data, &st); err != nil || st.Type == unix.TMPFS_MAGIC {
-		fmt.Fprintf(os.Stderr, "harness: %s is a tmpfs or can't be checked (%v); data directories must be on a disk\n", dataRoot, err)
+		fmt.Fprintf(os.Stderr, "harness: %s is a tmpfs or can't be checked (%v); data directories must be on a disk\n", root, err)
 		return 1
 	}
 	return m.Run()
+}
+
+// dataRoot returns the directory to make the containers' data directories
+// in: RECON_E2E_DATA_ROOT, or defaultDataRoot if it is unset. It makes the
+// directory absolute, because the engine takes a relative bind-mount
+// source for the name of a volume.
+func dataRoot() (string, error) {
+	root := os.Getenv("RECON_E2E_DATA_ROOT")
+	if root == "" {
+		return defaultDataRoot, nil
+	}
+	return filepath.Abs(root)
 }
 
 // engine runs the container engine with args and returns its combined
