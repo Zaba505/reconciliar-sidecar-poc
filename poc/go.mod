@@ -4,6 +4,8 @@ go 1.27.0
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/klauspost/compress v1.20.3
+	github.com/z5labs/avro-go v0.6.0
 	github.com/z5labs/bedrock v0.25.0
 	github.com/z5labs/humus v0.16.0
 	github.com/z5labs/humus/grpc v0.16.0

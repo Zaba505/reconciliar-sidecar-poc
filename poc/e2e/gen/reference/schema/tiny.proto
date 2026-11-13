@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package gen.tiny;
+
+option go_package = "poc/e2e/gen/reference/pb/tiny";
+
+enum TinyStatus {
+  TINY_STATUS_UNSPECIFIED = 0;
+  TINY_STATUS_OK = 1;
+  TINY_STATUS_PENDING = 2;
+  TINY_STATUS_FAILED = 3;
+}
+
+message Date {
+  int32 year = 1;
+  int32 month = 2;
+  int32 day = 3;
+}
+
+message Tiny {
+  fixed64 id = 1;
+  sint64 amount_minor = 2;
+  TinyStatus status = 3;
+  Date value_date = 4;
+}

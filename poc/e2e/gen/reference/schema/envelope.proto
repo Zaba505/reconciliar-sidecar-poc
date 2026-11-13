@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package gen.envelope;
+
+option go_package = "poc/e2e/gen/reference/pb/envelope";
+
+message Envelope {
+  fixed64 id = 1;
+  string key_id = 2;
+  bytes nonce = 3;
+  bytes ciphertext = 4;
+}

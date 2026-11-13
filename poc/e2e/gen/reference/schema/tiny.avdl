@@ -1,0 +1,18 @@
+namespace gen.tiny;
+
+schema Tiny;
+
+fixed Id(8);
+
+enum TinyStatus {
+  OK,
+  PENDING,
+  FAILED
+}
+
+record Tiny {
+  Id id;
+  long amount_minor;
+  TinyStatus status;
+  int value_date;
+}

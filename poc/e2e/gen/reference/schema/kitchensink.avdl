@@ -1,0 +1,93 @@
+namespace gen.kitchensink;
+
+schema KitchenSink;
+
+fixed Id(8);
+
+enum Color {
+  RED,
+  GREEN
+}
+
+enum Shade {
+  PALE,
+  DARK,
+  DEEP
+}
+
+record Money {
+  string currency_code;
+  bytes amount;
+}
+
+record Zeros {
+  int zero;
+  string none;
+}
+
+record Inner {
+  union { null, string } word;
+  array<int> nums;
+}
+
+record Deep {
+  string user;
+  union { null, string } terminal;
+  array<string> account;
+  string bank;
+  Money fee;
+}
+
+record Item {
+  long at;
+  union { null, int } due;
+  Deep deep;
+}
+
+record KitchenSink {
+  Id id;
+  string key;
+  string empty;
+  union { null, string } maybe_empty;
+  array<string> words;
+  union { null, string } company;
+  array<string> choices;
+  bytes blob;
+  union { null, bytes } maybe_blob;
+  array<bytes> blobs;
+  int zero32;
+  union { null, int } maybe_zero32;
+  int small32;
+  array<int> ints32;
+  long extreme64;
+  union { null, long } maybe64;
+  long wide64;
+  array<long> small64s;
+  long small_s64;
+  union { null, long } maybe_s64;
+  array<long> s64s;
+  double zero_double;
+  union { null, double } maybe_double;
+  array<double> huge_doubles;
+  array<double> doubles;
+  boolean flag;
+  union { null, boolean } maybe_flag;
+  array<boolean> flags;
+  Color color;
+  array<Shade> shades;
+  union { null, long } maybe_at;
+  int first_day;
+  long at_base;
+  array<long> ats;
+  union { null, int } maybe_day;
+  array<int> days;
+  Money zero_amount;
+  Money fee_of_zero;
+  Money amount;
+  union { null, Money } maybe_fee;
+  array<Money> amounts;
+  Zeros zeros;
+  Inner inner;
+  array<Item> items;
+  array<int> long_list;
+}

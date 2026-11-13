@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+package gen.kitchensink;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "poc/e2e/gen/reference/pb/kitchensink";
+
+enum Color {
+  COLOR_UNSPECIFIED = 0;
+  COLOR_RED = 1;
+  COLOR_GREEN = 2;
+}
+
+enum Shade {
+  SHADE_UNSPECIFIED = 0;
+  SHADE_PALE = 1;
+  SHADE_DARK = 2;
+  SHADE_DEEP = 3;
+}
+
+message Date {
+  int32 year = 1;
+  int32 month = 2;
+  int32 day = 3;
+}
+
+message Money {
+  string currency_code = 1;
+  int64 units = 2;
+  int32 nanos = 3;
+}
+
+message Zeros {
+  int32 zero = 1;
+  string none = 2;
+}
+
+message Inner {
+  optional string word = 1;
+  repeated int32 nums = 2;
+}
+
+message Deep {
+  string user = 1;
+  optional string terminal = 2;
+  repeated string account = 3;
+  string bank = 4;
+  Money fee = 5;
+}
+
+message Item {
+  google.protobuf.Timestamp at = 1;
+  optional Date due = 2;
+  Deep deep = 3;
+}
+
+message KitchenSink {
+  fixed64 id = 1;
+  string key = 2;
+  string empty = 3;
+  optional string maybe_empty = 4;
+  repeated string words = 5;
+  optional string company = 6;
+  repeated string choices = 7;
+  bytes blob = 8;
+  optional bytes maybe_blob = 9;
+  repeated bytes blobs = 10;
+  int32 zero32 = 11;
+  optional int32 maybe_zero32 = 12;
+  int32 small32 = 13;
+  repeated int32 ints32 = 14;
+  int64 extreme64 = 15;
+  optional int64 maybe64 = 16;
+  int64 wide64 = 17;
+  repeated int64 small64s = 18;
+  sint64 small_s64 = 19;
+  optional sint64 maybe_s64 = 20;
+  repeated sint64 s64s = 21;
+  double zero_double = 22;
+  optional double maybe_double = 23;
+  repeated double huge_doubles = 24;
+  repeated double doubles = 25;
+  bool flag = 26;
+  optional bool maybe_flag = 27;
+  repeated bool flags = 28;
+  Color color = 29;
+  repeated Shade shades = 30;
+  optional google.protobuf.Timestamp maybe_at = 31;
+  Date first_day = 32;
+  google.protobuf.Timestamp at_base = 33;
+  repeated google.protobuf.Timestamp ats = 34;
+  optional Date maybe_day = 35;
+  repeated Date days = 36;
+  Money zero_amount = 37;
+  Money fee_of_zero = 38;
+  Money amount = 39;
+  optional Money maybe_fee = 40;
+  repeated Money amounts = 41;
+  Zeros zeros = 42;
+  Inner inner = 43;
+  repeated Item items = 44;
+  repeated int32 long_list = 45;
+}

@@ -1,0 +1,28 @@
+namespace gen.bankline;
+
+schema BankLine;
+
+fixed Id(8);
+
+record Money {
+  string currency_code;
+  bytes amount;
+}
+
+record BankParty {
+  string name;
+  union { null, string } bic;
+}
+
+record BankLine {
+  Id id;
+  string bank_ref;
+  string account;
+  long booked_at;
+  int value_date;
+  Money amount;
+  string bank_tx_code;
+  BankParty counterparty;
+  union { null, string } remittance_info;
+  Money balance_after;
+}

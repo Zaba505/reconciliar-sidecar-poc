@@ -1,0 +1,12 @@
+namespace gen.envelope;
+
+schema Envelope;
+
+fixed Id(8);
+
+record Envelope {
+  Id id;
+  string key_id;
+  bytes nonce;
+  bytes ciphertext;
+}

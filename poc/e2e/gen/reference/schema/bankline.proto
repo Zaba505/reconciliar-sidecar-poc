@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package gen.bankline;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "poc/e2e/gen/reference/pb/bankline";
+
+message Date {
+  int32 year = 1;
+  int32 month = 2;
+  int32 day = 3;
+}
+
+message Money {
+  string currency_code = 1;
+  int64 units = 2;
+  int32 nanos = 3;
+}
+
+message BankParty {
+  string name = 1;
+  optional string bic = 2;
+}
+
+message BankLine {
+  fixed64 id = 1;
+  string bank_ref = 2;
+  string account = 3;
+  google.protobuf.Timestamp booked_at = 4;
+  Date value_date = 5;
+  Money amount = 6;
+  string bank_tx_code = 7;
+  BankParty counterparty = 8;
+  optional string remittance_info = 9;
+  Money balance_after = 10;
+}

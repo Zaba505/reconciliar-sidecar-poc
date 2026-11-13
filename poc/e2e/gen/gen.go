@@ -2,82 +2,122 @@
 // output against them without holding the dataset (§8.3).
 //
 // Data comes from a Config: key k gets Counts(k) left and right records,
-// 0 to 3 each, with values derived from (side, k, j). A Verifier checks each
-// result against its key's expectation as it streams by, and a Fingerprint
-// summarizes output so that configurations can be compared without storing
-// it.
+// 0 to 3 each, with values derived from (side, k, j). A value is either a
+// legacy one, a header and a repeated pattern, or a record of a Schema
+// marshaled as protobuf, Avro or JSON exactly as generated code would
+// marshal it. A Verifier checks each result against its key's expectation
+// as it streams by, and a Fingerprint summarizes output so that
+// configurations can be compared without storing it.
 package gen
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"iter"
-	"strconv"
-
-	"github.com/zeebo/xxh3"
+	"math"
 
 	"poc/e2e/harness"
-	reconv1 "poc/gen/recon/v1"
-	"poc/internal/oracle"
 )
 
 // Config describes a synthetic run.
+//
+// A Config with no schemas makes legacy values: ValueSize bytes of a
+// header and a repeated pattern, which compress far better than real
+// data. A Config with a Schema on both sides makes realistic values: marshaled records,
+// a different schema and encoding on each side if need be. A Config has
+// schemas on both sides or on neither (see Validate).
 type Config struct {
 	Seed      uint64
 	Keys      int // keys 0 to Keys-1
-	ValueSize int // bytes per value, at least valueHeader
+	ValueSize int // bytes per legacy value, at least 10
+
+	Left, Right Values    // how each side's values are made
+	Mix         Mix       // how many records each side of a key has
+	KeyFormat   KeyFormat // how key indexes become key bytes
 }
 
-// valueHeader is the side, key and index every value starts with.
-const valueHeader = 1 + 8 + 1
+// Validate reports whether c can be generated: Keys is in range for its
+// KeyFormat, both sides or neither have a schema, the schemas are valid,
+// and no record's identity is 0, which protobuf would leave out.
+func (c Config) Validate() error {
+	switch {
+	case c.Keys < 0 || c.Keys > maxKeys:
+		return fmt.Errorf("%d keys is not in [0, 2^60]", c.Keys)
+	case c.KeyFormat == DecimalKeys && c.Keys > maxDecimalKey:
+		return fmt.Errorf("%d keys don't fit %d decimal digits", c.Keys, decimalDigits)
+	case c.KeyFormat != DecimalKeys && c.KeyFormat != RFKeys:
+		return fmt.Errorf("unknown key format %v", c.KeyFormat)
+	case c.Mix != Stress && c.Mix != Typical:
+		return fmt.Errorf("unknown mix %v", c.Mix)
+	case (c.Left.Schema == nil) != (c.Right.Schema == nil):
+		return errors.New("a schema on one side only: give both sides a schema, or neither")
+	case c.Left.Schema == nil:
+		return nil
+	}
+	for _, v := range []Values{c.Left, c.Right} {
+		if v.Encoding < Protobuf || v.Encoding > JSON {
+			return fmt.Errorf("unknown encoding %v", v.Encoding)
+		}
+		if err := v.Schema.Validate(); err != nil {
+			return err
+		}
+	}
+	if side, k, _ := c.ParseIdentity(0); (side == harness.Left || side == harness.Right) && k < c.Keys {
+		return fmt.Errorf("seed %d gives a record the identity 0, which protobuf leaves out: pick another seed", c.Seed)
+	}
+	return nil
+}
 
 // block is how many keys Records emits one side of at a time, so that
 // Ingest batches hold many records.
 const block = 1024
 
-// Counts returns how many left and right records key k has.
-func (c Config) Counts(k int) (left, right int) {
-	h := xxh3.HashSeed(binary.LittleEndian.AppendUint64(nil, uint64(k)), c.Seed)
-	return int(h & 3), int(h >> 2 & 3)
+// slabSize is the size of the buffers Records carves keys and values from.
+const slabSize = 1 << 20
+
+// slab hands out byte slices that are never reused, because Ingest keeps
+// the records it is given until it sends their batch. Carving them from
+// big buffers saves an allocation per record.
+type slab struct{ b []byte }
+
+// key carves key k.
+func (s *slab) key(c Config, k int) []byte {
+	if cap(s.b)-len(s.b) < 32 {
+		s.b = make([]byte, 0, slabSize)
+	}
+	return s.take(c.AppendKey(s.b[len(s.b):], k))
 }
 
-// Key returns key k's bytes.
-func (c Config) Key(k int) []byte {
-	return fmt.Appendf(nil, "key-%012d", k)
+// value carves the value of key k's j-th record on side. A value that
+// doesn't fit the rest of the buffer gets its own allocation, from append,
+// and the next one starts a new buffer.
+func (s *slab) value(g *ValueGen, side harness.Side, k, j int) []byte {
+	if cap(s.b)-len(s.b) < 64 {
+		s.b = make([]byte, 0, slabSize)
+	}
+	return s.take(g.Append(s.b[len(s.b):], side, k, j))
 }
 
-func (c Config) parseKey(key []byte) (int, bool) {
-	s, ok := bytes.CutPrefix(key, []byte("key-"))
-	if !ok || len(s) != 12 {
-		return 0, false
+// take accounts for v, appended at the end of the buffer. Appending only
+// moves to a new array when the end is full, so v is in the buffer if
+// and only if it fits.
+func (s *slab) take(v []byte) []byte {
+	if room := cap(s.b) - len(s.b); len(v) <= room {
+		s.b = s.b[:len(s.b)+len(v)]
+	} else {
+		s.b = nil
 	}
-	k, err := strconv.Atoi(string(s))
-	if err != nil || k < 0 || k >= c.Keys {
-		return 0, false
-	}
-	return k, true
-}
-
-// Value returns the value of key k's j-th record on side.
-func (c Config) Value(side harness.Side, k, j int) []byte {
-	v := make([]byte, max(c.ValueSize, valueHeader))
-	v[0] = byte(side)
-	binary.LittleEndian.PutUint64(v[1:], uint64(k))
-	v[9] = byte(j)
-	fill := xxh3.HashSeed(v[:valueHeader], c.Seed)
-	for i := valueHeader; i < len(v); i++ {
-		v[i] = byte(fill >> (8 * (i % 8)))
-	}
-	return v
+	return v[:len(v):len(v)]
 }
 
 // Records returns the records of the keys k with k mod parts == part, so
 // that parts streams can ingest the run between them. Each block of keys
-// emits its left records, then its right ones.
+// emits its left records, then its right ones. Different parts can be
+// iterated at once. The yielded keys and values are never reused.
 func (c Config) Records(part, parts int) iter.Seq[harness.Record] {
 	return func(yield func(harness.Record) bool) {
+		g := c.ValueGen()
+		var s slab
 		for start := 0; start < c.Keys; start += block {
 			for _, side := range []harness.Side{harness.Left, harness.Right} {
 				for k := start; k < min(start+block, c.Keys); k++ {
@@ -89,7 +129,8 @@ func (c Config) Records(part, parts int) iter.Seq[harness.Record] {
 						n = m
 					}
 					for j := range n {
-						if !yield(harness.Record{Side: side, Key: c.Key(k), Value: c.Value(side, k, j)}) {
+						key := s.key(c, k)
+						if !yield(harness.Record{Side: side, Key: key, Value: s.value(g, side, k, j)}) {
 							return
 						}
 					}
@@ -109,166 +150,53 @@ func (c Config) Totals() (left, right uint64) {
 	return left, right
 }
 
-// Verifier checks a Join's results against a Config. It keeps 4 bits per
-// key: one for its Match, and one for each one-sided record.
-type Verifier struct {
-	c      Config
-	seen   []uint64
-	counts [2]uint64
-}
+// KeysFor samples to size a run: sizeSamples values of each side give
+// their mean size, spread sampleStride keys apart, and the counts of up to
+// countSamples keys are added up one by one before KeysFor extrapolates.
+const (
+	sizeSamples  = 16 << 10
+	sampleStride = 50_000_017 // keeps sampled keys below 10^12
+	countSamples = 4 << 20
+)
 
-// NewVerifier returns a Verifier of c's run.
-func NewVerifier(c Config) *Verifier {
-	return &Verifier{c: c, seen: make([]uint64, (c.Keys+15)/16)}
-}
-
-// mark sets bit b of key k, failing if it was set already.
-func (v *Verifier) mark(k, b int) error {
-	bit := uint64(1) << (k%16*4 + b)
-	if v.seen[k/16]&bit != 0 {
-		return fmt.Errorf("key %d: result %d seen twice", k, b)
-	}
-	v.seen[k/16] |= bit
-	return nil
-}
-
-// Add checks one result.
-func (v *Verifier) Add(r *reconv1.JoinResult) error {
-	var (
-		side  harness.Side
-		rec   *reconv1.Record
-		match *reconv1.Match
-	)
-	switch res := r.GetResult().(type) {
-	case *reconv1.JoinResult_LeftOnly:
-		side, rec = harness.Left, res.LeftOnly
-	case *reconv1.JoinResult_RightOnly:
-		side, rec = harness.Right, res.RightOnly
-	case *reconv1.JoinResult_Both:
-		match = res.Both
-	default:
-		return errors.New("a result with no state")
-	}
-	key := rec.GetKey()
-	if match != nil {
-		key = match.GetKey()
-	}
-	k, ok := v.c.parseKey(key)
-	if !ok {
-		return fmt.Errorf("unexpected key %q", key)
-	}
-	l, rt := v.c.Counts(k)
-
-	if match != nil {
-		if l == 0 || rt == 0 {
-			return fmt.Errorf("key %d: a Match, but it has %d left and %d right records", k, l, rt)
+// KeysFor returns how many keys make a run of about keyValueBytes bytes of
+// keys and values, as Records yields them, up to as many as c.KeyFormat
+// has; c.Keys is ignored. It takes each side's mean value size from 16Ki
+// values of keys spread far apart, then adds up keys' records by c.Mix,
+// key 0 first, until they reach keyValueBytes. Past 4Mi keys it
+// extrapolates from their mean. A legacy run's value size is fixed, so
+// below 4Mi keys it returns exactly the fewest keys that reach
+// keyValueBytes. It panics if c is not valid.
+func (c Config) KeysFor(keyValueBytes int64) int {
+	c.Keys = 0 // so that Validate passes whatever c.Keys was
+	g := c.ValueGen()
+	key := float64(len(c.Key(0)))
+	var record [2]float64 // mean key and value bytes of a record, per side
+	var buf []byte
+	for i, side := range []harness.Side{harness.Left, harness.Right} {
+		var total int
+		for n := range sizeSamples {
+			buf = g.Append(buf[:0], side, n*sampleStride, n%3)
+			total += len(buf)
 		}
-		if err := v.values(k, harness.Left, match.GetLeft(), l); err != nil {
-			return err
+		record[i] = key + float64(total)/sizeSamples
+	}
+	target := float64(keyValueBytes)
+	var sum float64
+	for k := range countSamples {
+		if sum >= target {
+			return k
 		}
-		if err := v.values(k, harness.Right, match.GetRight(), rt); err != nil {
-			return err
-		}
-		v.counts[0] += uint64(l)
-		v.counts[1] += uint64(rt)
-		return v.mark(k, 0)
+		l, r := c.Counts(k)
+		sum += float64(l)*record[0] + float64(r)*record[1]
 	}
-
-	n, other := l, rt
-	if side == harness.Right {
-		n, other = rt, l
+	if sum >= target {
+		return countSamples
 	}
-	if other > 0 {
-		return fmt.Errorf("key %d: a %s-only result, but it has records on both sides", k, sideName(side))
+	limit := float64(maxKeys)
+	if c.KeyFormat == DecimalKeys {
+		limit = maxDecimalKey
 	}
-	j, err := v.value(k, side, rec.GetValue(), n)
-	if err != nil {
-		return err
-	}
-	v.counts[side-1]++
-	return v.mark(k, 1+j)
-}
-
-// values checks that vs are key k's n values on side, in any order.
-func (v *Verifier) values(k int, side harness.Side, vs [][]byte, n int) error {
-	if len(vs) != n {
-		return fmt.Errorf("key %d: %d %s values, want %d", k, len(vs), sideName(side), n)
-	}
-	var seen [4]bool
-	for _, val := range vs {
-		j, err := v.value(k, side, val, n)
-		if err != nil {
-			return err
-		}
-		if seen[j] {
-			return fmt.Errorf("key %d: %s value %d appears twice", k, sideName(side), j)
-		}
-		seen[j] = true
-	}
-	return nil
-}
-
-// value checks that val is one of key k's n values on side and returns its
-// index.
-func (v *Verifier) value(k int, side harness.Side, val []byte, n int) (int, error) {
-	if len(val) < valueHeader {
-		return 0, fmt.Errorf("key %d: a %d-byte value", k, len(val))
-	}
-	j := int(val[9])
-	if j >= n || !bytes.Equal(val, v.c.Value(side, k, j)) {
-		return 0, fmt.Errorf("key %d: a %s value that isn't one of its %d", k, sideName(side), n)
-	}
-	return j, nil
-}
-
-func sideName(s harness.Side) string {
-	if s == harness.Left {
-		return "left"
-	}
-	return "right"
-}
-
-// Finish checks that every key's results were all seen, and that they
-// hold each side's total of records.
-func (v *Verifier) Finish() error {
-	var missing int
-	first := -1
-	for k := range v.c.Keys {
-		l, r := v.c.Counts(k)
-		var want uint64
-		switch {
-		case l > 0 && r > 0:
-			want = 1
-		default:
-			want = (uint64(1)<<max(l, r) - 1) << 1
-		}
-		if got := v.seen[k/16] >> (k % 16 * 4) & 0xf; got != want {
-			missing++
-			if first < 0 {
-				first = k
-			}
-		}
-	}
-	if missing > 0 {
-		return fmt.Errorf("%d keys are missing results, the first key %d", missing, first)
-	}
-	left, right := v.c.Totals()
-	if v.counts != [2]uint64{left, right} {
-		return fmt.Errorf("counted %d left and %d right records, want %d and %d", v.counts[0], v.counts[1], left, right)
-	}
-	return nil
-}
-
-// Fingerprint is an order-independent summary of a Join's results: the sum
-// and XOR of the XXH3 of each canonical result, and their count.
-type Fingerprint struct {
-	Sum, Xor, Count uint64
-}
-
-// Add adds one result.
-func (f *Fingerprint) Add(r *reconv1.JoinResult) {
-	h := xxh3.Hash(oracle.Canonical(r))
-	f.Sum += h
-	f.Xor ^= h
-	f.Count++
+	n := countSamples + math.Ceil((target-sum)/(sum/countSamples))
+	return int(min(n, limit))
 }

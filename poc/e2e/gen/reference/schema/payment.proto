@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package gen.payment;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "poc/e2e/gen/reference/pb/payment";
+
+enum Country {
+  COUNTRY_UNSPECIFIED = 0;
+  COUNTRY_GB = 1;
+  COUNTRY_DE = 2;
+  COUNTRY_FR = 3;
+  COUNTRY_NL = 4;
+  COUNTRY_ES = 5;
+  COUNTRY_IT = 6;
+  COUNTRY_BE = 7;
+  COUNTRY_IE = 8;
+  COUNTRY_US = 9;
+  COUNTRY_CH = 10;
+}
+
+message Party {
+  string name = 1;
+  string account = 2;
+  optional string bic = 3;
+  Country country = 4;
+}
+
+enum PaymentType {
+  PAYMENT_TYPE_UNSPECIFIED = 0;
+  PAYMENT_TYPE_PAYMENT = 1;
+  PAYMENT_TYPE_TRANSFER = 2;
+  PAYMENT_TYPE_CARD = 3;
+  PAYMENT_TYPE_FEE = 4;
+  PAYMENT_TYPE_FX = 5;
+  PAYMENT_TYPE_REFUND = 6;
+  PAYMENT_TYPE_INTEREST = 7;
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_DEBIT = 1;
+  DIRECTION_CREDIT = 2;
+}
+
+message Money {
+  string currency_code = 1;
+  int64 units = 2;
+  int32 nanos = 3;
+}
+
+message Date {
+  int32 year = 1;
+  int32 month = 2;
+  int32 day = 3;
+}
+
+enum PaymentStatus {
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  PAYMENT_STATUS_SETTLED = 1;
+  PAYMENT_STATUS_PENDING = 2;
+  PAYMENT_STATUS_REVERSED = 3;
+  PAYMENT_STATUS_FAILED = 4;
+}
+
+enum Channel {
+  CHANNEL_UNSPECIFIED = 0;
+  CHANNEL_API = 1;
+  CHANNEL_BATCH = 2;
+  CHANNEL_SWIFT = 3;
+  CHANNEL_SEPA = 4;
+  CHANNEL_ACH = 5;
+  CHANNEL_CARD_NETWORK = 6;
+}
+
+enum FeeKind {
+  FEE_KIND_UNSPECIFIED = 0;
+  FEE_KIND_WIRE_FEE = 1;
+  FEE_KIND_FX_FEE = 2;
+  FEE_KIND_SERVICE_FEE = 3;
+}
+
+message Fee {
+  FeeKind kind = 1;
+  Money amount = 2;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+message Payment {
+  fixed64 id = 1;
+  string payment_ref = 2;
+  string account_id = 3;
+  Party counterparty = 4;
+  PaymentType type = 5;
+  Direction direction = 6;
+  Money amount = 7;
+  optional double fx_rate = 8;
+  google.protobuf.Timestamp booked_at = 9;
+  Date value_date = 10;
+  PaymentStatus status = 11;
+  Channel channel = 12;
+  optional string end_to_end_id = 13;
+  int64 batch_id = 14;
+  optional string memo = 15;
+  string created_by = 16;
+  int32 version = 17;
+  bool reconciled = 18;
+  repeated string tags = 19;
+  repeated Fee fees = 20;
+  repeated KeyValue metadata = 21;
+}
