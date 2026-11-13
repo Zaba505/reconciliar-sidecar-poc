@@ -1,0 +1,16 @@
+FROM docker.io/library/golang:1.27@sha256:ec47ea3725fea0cc88f6de94919aef19f40f12fc1ec0e2d1b3426dbf15ecca04 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/recon-sidecar ./cmd/recon-sidecar \
+ && mkdir -p /out/data
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+COPY --from=build /out/recon-sidecar /recon-sidecar
+COPY --from=build --chown=65532:65532 /out/data /var/lib/recon
+ENV RECON_LISTEN=:7443 RECON_HEALTH_ADDR=:8081 RECON_DATA_DIR=/var/lib/recon
+EXPOSE 7443 8081
+USER 65532:65532
+ENTRYPOINT ["/recon-sidecar"]
