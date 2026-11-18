@@ -6,7 +6,7 @@ Nov 16, 2026
 
 ## Recommendation
 
-Adopt sorted runs with a streaming merge join. At 10 GiB under a 128 MiB budget it finishes ingest plus join in 50 s against 73 s for the current design, writes 92 files instead of 150,716, and holds that time when page cache is scarce.
+Adopt sorted runs with a streaming merge join. At 10 GiB under a 128 MiB memory budget it finishes ingest plus join in 50 s against 73 s for the current design, writes 92 files instead of 150,716, and holds that time when page cache is scarce.
 
 - **Why this one.** It is the only design that both ends the file explosion and stops loading buckets into memory. A Join holds one key at a time, so bucket sizing, re-partitioning and the unit-sized `HOT_KEY` limit go away. The segmented log is as fast, but it keeps the current join and its limits.
 - **The value log with a B-tree index is not recommended.** The index cannot fit the budget: 1.9 GB of entries at 10 GiB. The Join still has to load every value. Rebuilt as sorted key runs over value logs it takes 56 s with ample page cache and 107 s without.
@@ -17,7 +17,13 @@ Adopt sorted runs with a streaming merge join. At 10 GiB under a 128 MiB budget 
 
 ## What a bucket is judged on
 
-A bucket's memory is a setting, not an outcome: the sidecar holds one fixed budget however large the run is. An architecture therefore cannot "use less memory". It can only change what the budget buys, and what the disk pays for it.
+**The budget** is the size of the sidecar's memory pool, set by `RECON_MEMORY_LIMIT_BYTES` and shared by every run. Anything that holds run data reserves from the pool before it allocates, and releases afterwards: decoded Ingest messages, buffered records, a Join's working set and its output batches. When a reservation does not fit, the sidecar spills records to disk to make room. It fails the request with `MEMORY_EXHAUSTED` only if nothing can be spilled.
+
+- **By default it is 70% of the container's memory limit:** 358 MiB in a 512 MiB container. This evaluation pinned it at 128 MiB in a 512 MiB container instead, so that 10 GiB of data is 80 times the budget and every design spills heavily.
+- **It is not the process's memory.** Garbage-collector headroom sits on top of it, so a 128 MiB budget peaked near 300 MiB resident. At the default budget, `GOMEMLIMIT` must be set to about 90% of the container limit, or the container is OOM-killed.
+- **What the process leaves of the container limit is page cache,** which spill writes and reads pass through. It was about 200 MiB in this evaluation's main runs, about 25 MiB in the 256 MiB container, and about 50 MiB at the default budget in a 512 MiB container.
+
+A bucket's memory is therefore a setting, not an outcome: the sidecar holds one fixed budget however large the run is. An architecture cannot "use less memory". It can only change what the budget buys, and what the disk pays for it.
 
 The workload is narrow, and every candidate is judged against it:
 
@@ -47,8 +53,8 @@ The current design is sound and predictable, and its two most visible faults are
 | A file list outside the budget | The list of spill files is not reserved. At 10 GiB under a 32 MiB budget the process held 299 MiB resident | Incidental. The same patch brings it to 107 MiB |
 | A planning factor of 2 | The real working set is 1.06 to 1.10 times the record bytes, so 46% of each unit budget sits idle. With 64 buckets the Join rewrote all 1.17 GB | Incidental. Plan from bytes plus 16 per record |
 | Output batches missing from the plan | The Join fails with `MEMORY_EXHAUSTED` at an 8 MiB budget | Incidental. Subtract them from the unit budget |
-| Spill pieces shrink as data grows | A piece is about 0.55 × budget / buckets: 73 KiB at default settings, 16 KiB at a 32 MiB budget. Ingest streams spend 93 to 95% of their time in the store waiting on spills | Inherent to per-bucket buffers |
-| Whole values in the join working set | One key's records must fit 16 MiB at default settings. A key on one side only fails with `HOT_KEY`, though it needs no Match | Inherent to loading units |
+| Spill pieces shrink as data grows | A piece is about 0.55 × budget / buckets: 73 KiB at a 128 MiB budget, 16 KiB at a 32 MiB budget. Ingest streams spend 93 to 95% of their time in the store waiting on spills | Inherent to per-bucket buffers |
+| Whole values in the join working set | One key's records must fit 16 MiB at a 128 MiB budget. A key on one side only fails with `HOT_KEY`, though it needs no Match | Inherent to loading units |
 | Slack in chunks | A full 128 MiB pool holds about 86 MiB of records | Inherent to per-bucket buffers |
 
 **What it is good at.** An alternative has to match these, and most of the candidates gave one up.
@@ -193,9 +199,9 @@ Sorted runs is not the fastest once data is 320 times the budget: its ingest sta
 
 ### On a slow disk
 
-On a disk throttled like a network volume the designs converge at default sizing, because every one of them writes and reads the data once. They separate again at a small budget, where the current design's spill pieces become IOPS-bound.
+On a disk throttled like a network volume the designs converge at a 128 MiB budget, because every one of them writes and reads the data once. They separate again at a small budget, where the current design's spill pieces become IOPS-bound.
 
-**On a throttled disk sorted runs lead by 8% at default sizing, 2.6 times at a tight budget**, against the current design. Seconds, with the disk limited to 3,000 IOPS and 125 MiB/s: a reviewer's single runs under a cgroup I/O throttle.
+**On a throttled disk sorted runs lead by 8% at a 128 MiB budget, 2.6 times at a tight budget**, against the current design. Seconds, with the disk limited to 3,000 IOPS and 125 MiB/s: a reviewer's single runs under a cgroup I/O throttle.
 
 | Design | 4 GiB at 128 MiB: ingest | 4 GiB at 128 MiB: join | 4 GiB at 128 MiB: total | 1 GiB at 32 MiB: ingest | 1 GiB at 32 MiB: join | 1 GiB at 32 MiB: total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -207,7 +213,7 @@ On a disk throttled like a network volume the designs converge at default sizing
 | Current | 48.7 | 36.5 | **85.2** | 24.4 | 21.8 | **46.2** |
 | Embedded engine | not run | not run | not run | 8.9 | 42.6 | **51.5** |
 
-So the speed lead holds where the disk is fast or the budget is tight. At default sizing on a slow volume, the case for sorted runs is what it removes and what it survives, not time.
+So the speed lead holds where the disk is fast or the budget is tight. At a 128 MiB budget on a slow volume, the case for sorted runs is what it removes and what it survives, not time.
 
 ## Recommended architecture in detail
 
@@ -255,7 +261,7 @@ Every visible change is a relaxation, with two exceptions. Seal and spills now t
 | Today | With sorted runs |
 | --- | --- |
 | `bucket_count` must be sized to the data | Accepted and ignored |
-| `HOT_KEY` when one key's records exceed half a unit budget (16 MiB at default settings), even for a one-sided key | `HOT_KEY` only when a Match exceeds `RECON_MAX_MATCH_BYTES`; a one-sided key streams at any size once condition 3 below is met |
+| `HOT_KEY` when one key's records exceed half a unit budget (16 MiB at a 128 MiB budget), even for a one-sided key | `HOT_KEY` only when a Match exceeds `RECON_MAX_MATCH_BYTES`; a one-sided key streams at any size once condition 3 below is met |
 | A Join may write: leftover spills and re-partitioned buckets | A Join of a spilled run never writes. A run that just fits in memory may be written once at Join |
 | `SealRun` returns at once | `SealRun` writes the last file: up to 0.65 s measured |
 | Many short ingest stalls behind per-bucket spills | One stall per spill, for all streams at once: about 0.2 s, 92 times, at 10 GiB on NVMe with spare page cache; about 1 s each on a 125 MiB/s volume |
@@ -277,7 +283,7 @@ The rule is arithmetic from the prototype's read-buffer plan. Measured points: 1
 Each condition comes from a reviewer's finding on the prototype. Conditions 2, 3 and 5 have tests that fail today, condition 1 is a reproduced failure, and condition 4 is a measurement with no multi-run test yet.
 
 1. **Direct I/O for run writes.** Buffered, a spill dirties up to a budget of page cache at once. On a throttled disk with little spare memory it was OOM-killed in 4 runs of 4; with direct I/O all 4 completed.
-2. **Large values read at emit time.** Values of 1 to 4 MiB fail the Join today, at the default budget too. A cursor should hold only the key and read a large value when it is emitted. This is key/value separation, used where it pays.
+2. **Large values read at emit time.** Values of 1 to 4 MiB fail the Join today, at a 128 MiB budget too. A cursor should hold only the key and read a large value when it is emitted. This is key/value separation, used where it pays.
 3. **A chunked arena.** A growing Match needs up to twice its size today. Chunks make it need its size once, and make an over-limit Match return `HOT_KEY` instead of `MEMORY_EXHAUSTED`.
 4. **A pool-owned free list.** After a spill, up to a whole budget of blocks stays allocated but unreserved: 126.9 of 128 MiB measured. That is safe for one run per pool and wrong for several.
 5. **Close cancels a Join.** Today Close waits, so `DeleteRun` would hang behind a stuck reader.
