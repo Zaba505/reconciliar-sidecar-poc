@@ -172,21 +172,21 @@ Sizes are the target key and value bytes; budgets are 128 MiB or the default of 
 
 ## Throughput, spill and disk
 
-| Data | Size, budget, `GOMEMLIMIT` | Key + value bytes (MiB) | Records | Ingest (s) | Ingest (MiB/s) | Seal (s) | Join (s) | Join (MiB/s) | Join (M records/s) | Run files after Seal | Run file bytes after Seal (MiB) | Disk peak (MiB) | Disk peak / key + value |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Payment/BankLine, protobuf | 1 GiB, 128 MiB, unset | 1,023 | 4.39 M | 4.7 | 216 | 0.02 | 2.5 | 409 | 1.76 | 10 | 1,069 | 1,069 | 1.05 |
-| Payment/BankLine, protobuf | 1 GiB, 128 MiB, 90% | 1,023 | 4.39 M | 4.7 | 218 | 0.01 | 2.7 | 374 | 1.61 | 10 | 1,069 | 1,069 | 1.05 |
-| Payment/BankLine, protobuf | 1 GiB, default, 90% | 1,023 | 4.39 M | 4.8 | 213 | 0.10 | 2.6 | 400 | 1.72 | 4 | 1,069 | 1,069 | 1.05 |
-| Payment/BankLine, protobuf | 10 GiB, 128 MiB, unset | 10,227 | 43.93 M | 46.9 | 218 | 0.03 | 23.3 | 440 | 1.89 | 92 | 10,688 | 10,688 | 1.05 |
-| Payment/BankLine, protobuf | 10 GiB, 128 MiB, 90% | 10,227 | 43.93 M | 47.6 | 215 | 0.02 | 23.7 | 432 | 1.86 | 92 | 10,688 | 10,688 | 1.05 |
-| Payment/BankLine, protobuf | 10 GiB, default, 90% | 10,227 | 43.93 M | 48.0 | 213 | 0.55 | 20.7 | 493 | 2.12 | 32 | 10,688 | 10,688 | 1.05 |
-| Payment/BankLine, Avro | 10 GiB, default, 90% | 10,226 | 53.14 M | 53.8 | 190 | 0.36 | 24.1 | 424 | 2.20 | 33 | 10,777 | 10,777 | 1.05 |
-| Payment/BankLine, JSON | 10 GiB, default, 90% | 10,237 | 20.33 M | 32.1 | 319 | 0.13 | 17.9 | 572 | 1.14 | 31 | 10,450 | 10,450 | 1.02 |
-| CardSettlement, protobuf | 10 GiB, default, 90% | 10,240 | 66.34 M | 59.1 | 173 | 0.39 | 24.1 | 425 | 2.75 | 34 | 10,935 | 10,935 | 1.07 |
-| Envelope, protobuf | 10 GiB, default, 90% | 10,242 | 17.90 M | 28.8 | 355 | 0.06 | 17.6 | 583 | 1.02 | 31 | 10,430 | 10,430 | 1.02 |
-| Tiny, protobuf | 275 MiB, 128 MiB, unset | 275 | 6.98 M | 2.1 | 132 | 0.21 | 2.2 | 124 | 3.15 | 4 | 342 | 342 | 1.24 |
-| Tiny, protobuf | 275 MiB, 128 MiB, 90% | 275 | 6.98 M | 2.1 | 130 | 0.23 | 2.1 | 129 | 3.28 | 4 | 342 | 342 | 1.24 |
-| Old generator, 1000-byte values | 10 GiB, default, 90% | 10,177 | 10.50 M | 21.2 | 481 | 0.15 | 11.4 | 893 | 0.92 | 30 | 10,287 | 10,287 | 1.01 |
+| Data | Size, budget, `GOMEMLIMIT` | Key + value bytes (MiB) | Left side: records, MiB (share) | Right side: records, MiB (share) | Records, both sides | Ingest (s) | Ingest (MiB/s) | Seal (s) | Join (s) | Join (MiB/s) | Join (M records/s) | Run files after Seal | Run file bytes after Seal (MiB) | Disk peak (MiB) | Disk peak / key + value |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Payment/BankLine, protobuf | 1 GiB, 128 MiB, unset | 1,023 | 2.20 M, 585 (57%) | 2.20 M, 438 (43%) | 4.39 M | 4.7 | 216 | 0.02 | 2.5 | 409 | 1.76 | 10 | 1,069 | 1,069 | 1.05 |
+| Payment/BankLine, protobuf | 1 GiB, 128 MiB, 90% | 1,023 | 2.20 M, 585 (57%) | 2.20 M, 438 (43%) | 4.39 M | 4.7 | 218 | 0.01 | 2.7 | 374 | 1.61 | 10 | 1,069 | 1,069 | 1.05 |
+| Payment/BankLine, protobuf | 1 GiB, default, 90% | 1,023 | 2.20 M, 585 (57%) | 2.20 M, 438 (43%) | 4.39 M | 4.8 | 213 | 0.10 | 2.6 | 400 | 1.72 | 4 | 1,069 | 1,069 | 1.05 |
+| Payment/BankLine, protobuf | 10 GiB, 128 MiB, unset | 10,227 | 21.96 M, 5,850 (57%) | 21.97 M, 4,378 (43%) | 43.93 M | 46.9 | 218 | 0.03 | 23.3 | 440 | 1.89 | 92 | 10,688 | 10,688 | 1.05 |
+| Payment/BankLine, protobuf | 10 GiB, 128 MiB, 90% | 10,227 | 21.96 M, 5,850 (57%) | 21.97 M, 4,378 (43%) | 43.93 M | 47.6 | 215 | 0.02 | 23.7 | 432 | 1.86 | 92 | 10,688 | 10,688 | 1.05 |
+| Payment/BankLine, protobuf | 10 GiB, default, 90% | 10,227 | 21.96 M, 5,850 (57%) | 21.97 M, 4,378 (43%) | 43.93 M | 48.0 | 213 | 0.55 | 20.7 | 493 | 2.12 | 32 | 10,688 | 10,688 | 1.05 |
+| Payment/BankLine, Avro | 10 GiB, default, 90% | 10,226 | 26.57 M, 6,017 (59%) | 26.57 M, 4,209 (41%) | 53.14 M | 53.8 | 190 | 0.36 | 24.1 | 424 | 2.20 | 33 | 10,777 | 10,777 | 1.05 |
+| Payment/BankLine, JSON | 10 GiB, default, 90% | 10,237 | 10.16 M, 6,133 (60%) | 10.16 M, 4,105 (40%) | 20.33 M | 32.1 | 319 | 0.13 | 17.9 | 572 | 1.14 | 31 | 10,450 | 10,450 | 1.02 |
+| CardSettlement, protobuf | 10 GiB, default, 90% | 10,240 | 33.17 M, 5,120 (50%) | 33.17 M, 5,120 (50%) | 66.34 M | 59.1 | 173 | 0.39 | 24.1 | 425 | 2.75 | 34 | 10,935 | 10,935 | 1.07 |
+| Envelope, protobuf | 10 GiB, default, 90% | 10,242 | 8.95 M, 5,121 (50%) | 8.95 M, 5,121 (50%) | 17.90 M | 28.8 | 355 | 0.06 | 17.6 | 583 | 1.02 | 31 | 10,430 | 10,430 | 1.02 |
+| Tiny, protobuf | 275 MiB, 128 MiB, unset | 275 | 3.49 M, 138 (50%) | 3.49 M, 138 (50%) | 6.98 M | 2.1 | 132 | 0.21 | 2.2 | 124 | 3.15 | 4 | 342 | 342 | 1.24 |
+| Tiny, protobuf | 275 MiB, 128 MiB, 90% | 275 | 3.49 M, 138 (50%) | 3.49 M, 138 (50%) | 6.98 M | 2.1 | 130 | 0.23 | 2.1 | 129 | 3.28 | 4 | 342 | 342 | 1.24 |
+| Old generator, 1000-byte values | 10 GiB, default, 90% | 10,177 | 5.25 M, 5,090 (50%) | 5.25 M, 5,087 (50%) | 10.50 M | 21.2 | 481 | 0.15 | 11.4 | 893 | 0.92 | 30 | 10,287 | 10,287 | 1.01 |
 
 The data in each run, from the RESULT's sample of its first records (value sizes in bytes, ratios of 64 KiB blocks in the run-file encoding), was the same as in the previous measurements:
 
@@ -200,6 +200,7 @@ The data in each run, from the RESULT's sample of its first records (value sizes
 | Tiny, protobuf | 23 | 23 | 24 | 24 | 25 | 1.19× | 1.43× |
 | Old generator | 1000 | 1000 | 1000 | 1000 | 1000 | 38.4× | 52.0× |
 
+- **Sides:** both sides have the same number of records, so the Payment/BankLine runs hold 57 to 60% of their bytes on the left, where the records are larger, and the single-profile runs split evenly. The side columns were counted by generating each scenario's data with the measurement's own configuration.
 - **Ingest** ran at 213 to 218 MiB/s for Payment and BankLine as protobuf, whatever the budget, and 173 to 355 MiB/s for the other profiles at 10 GiB: 0.6 to 1.1 M records/s. The client generated the data on the same 32 CPUs, so these are lower bounds for the sidecar. A larger budget wrote about a third as many files and didn't change the time.
 - **Seal** took 0.01 to 0.55 s: writing what was left in memory as the last file, which is more at the larger budget.
 - **The join** ran at 374 to 493 MiB/s for Payment and BankLine as protobuf and 424 to 583 MiB/s for the other profiles at 10 GiB, with 4 workers, including the client's verification of every result: 1.0 to 2.8 M records/s, fastest in MiB/s for the largest records and in records/s for the smallest. With the old 1 KB values it ran at 893 MiB/s.
