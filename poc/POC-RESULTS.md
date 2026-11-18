@@ -50,6 +50,7 @@ There are five profiles. These are their sizes and ratios as `datastats` measure
 - **Match mix:** the Typical mix. About 93% of keys have one record on each side, 3% are left-only, 3% are right-only, and 1% are 1:N or N:1 with N of 2 or 3.
 - **Keys:** "RF" and 16 hex digits of a scramble of the key's number, 18 bytes.
 - **Sizing:** each scenario names a target in key and value bytes, and the generator picks the number of keys from a sampled mean record size. Every throughput below divides the key and value bytes the client actually sent: 1,023 MiB for the 1 GiB scenarios, 10,226 to 10,242 MiB for the 10 GiB ones and 275 MiB for Tiny. The old generator's number of keys is fixed, which gives 10,177 MiB.
+- **The sides:** the target is the total over both sides. Both sides have the same number of records, so they split the bytes evenly only when they have the same profile. For Payment on the left and BankLine on the right, the left side holds 57% of the bytes as protobuf (5.71 GiB against 4.28 GiB at 10 GiB, 21.97 M records each), 59% as Avro and 60% as JSON, because a Payment record is larger. CardSettlement, Envelope and the old generator split 50/50.
 - **The old generator** ran once more for comparison, with its old settings: 16-byte keys (`key-%012d`), 1000-byte values of a header and a repeated pattern, and the Stress mix of 0 to 3 records per side per key.
 
 ### Scenarios
