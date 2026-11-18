@@ -174,7 +174,7 @@ flowchart TB
 
 **At Seal,** a run that spilled writes its last file. A run that didn't keeps its blocks in memory, and stays spillable: if another run needs the room, the sealed run is spilled like any other.
 
-**At Join time,** the workers reserve their memory before the run is pinned, so if a run still in memory doesn't fit next to it, the reservation spills it and the Join reads the file instead. Once pinned, a run's blocks can't be spilled from under the Join. Then the Join holds one key at a time per worker, plus read buffers: 68 MiB reserved during the 10 GiB join of the evaluation, of a 128 MiB budget.
+**At Join time,** the workers reserve their memory before the run is pinned, so if a run still in memory doesn't fit next to it, the reservation spills it and the Join reads the file instead. Once pinned, a run's blocks can't be spilled from under the Join. Then the Join holds one key at a time per worker, plus read buffers: 63 MiB of them for the 92 files of a 10 GiB run under a 128 MiB budget (see [Performance](#performance)).
 
 **The pool runs out** only when what it can't reclaim leaves no room: in-flight messages, read buffers, arenas, fence tables and pinned runs. In practice that means several Joins at once under a small budget, a `Match` within the limit whose many tiny values take more than twice the limit to hold, or an Ingest message larger than the budget. The request then fails with `MEMORY_EXHAUSTED` instead of the container being OOM-killed.
 
@@ -186,7 +186,7 @@ Join read memory is files × workers × read buffer, and the number of files gro
 budget ≥ sqrt(0.3 MiB × workers × data)
 ```
 
-That is about 110 MiB for 10 GiB with 4 workers. Below it, read buffers shrink first, then the join gives up workers, then Seal merges files. It slows down instead of failing. Measured on the evaluation's prototype: 10 GiB at 128 MiB (92 files, full speed), 10 GiB at 32 MiB (403 files, one worker, 67.5 s join) and 4 GiB at 16 MiB (326 files, one worker, 53.4 s join).
+That is about 110 MiB for 10 GiB with 4 workers. Below it, read buffers shrink first, then the join gives up workers, then Seal merges files. It slows down instead of failing. Measured here, 10 GiB at 128 MiB joined 92 files with 4 workers and read buffers of 176 KiB, at full speed. Measured on the evaluation's prototype, which this code follows: 10 GiB at 32 MiB (403 files, one worker, 67.5 s join) and 4 GiB at 16 MiB (326 files, one worker, 53.4 s join).
 
 - **Raise three things together:** the container's memory limit, the budget (by default 70% of that limit) and `GOMEMLIMIT` (about 90% of it). Raising the budget without `GOMEMLIMIT` gets the container OOM-killed. Raising the container limit alone does nothing unless the budget follows it, which it does by default.
 - **Several runs share the pool.** Eight runs in a 128 MiB pool leave each about 16 MiB, which is the regime where the join slows.
@@ -305,7 +305,7 @@ The e2e tests drive the image through the engine's CLI. Set `RECON_E2E_ENGINE` t
 
 The test data comes from `e2e/gen`, which marshals realistic records as protobuf, Avro or JSON. To see how large and how compressible its profiles are, or to check them against a file of your own values, run `go run ./e2e/gen/cmd/datastats` (`-h` lists the options).
 
-To reproduce the performance numbers, use a data root the filesystem doesn't compress. On btrfs, make an empty directory and run `chattr +m` on it before anything is written there. A pass takes about 12 minutes and needs about 11 GiB of free disk in the data root:
+To reproduce the performance numbers, use a data root the filesystem doesn't compress. On btrfs, make an empty directory and run `chattr +m` on it before anything is written there. A pass takes about 10 minutes and needs about 11 GiB of free disk in the data root:
 
 ```sh
 mkdir /var/tmp/recon-e2e-nocomp && chattr +m /var/tmp/recon-e2e-nocomp
@@ -315,35 +315,33 @@ RECON_E2E_IMAGE=recon-sidecar:dev RECON_E2E_DATA_ROOT=/var/tmp/recon-e2e-nocomp 
 
 ## Performance
 
-> **These numbers were measured on the hash-bucket design this refactor replaced**, before it. They show what the API, the pool and Go's garbage collector cost, which sorted runs don't change. For sorted runs against the bucket design on the same data and limits (10 GiB in 50 s against 73 s at a 128 MiB budget, 92 files against 150,716), see [BUCKET_ARCHITECTURE_EVALUATION.md](BUCKET_ARCHITECTURE_EVALUATION.md#comparison); those were measured on the evaluation's prototype, not on this code. The "Spill files" and "Expansion factor" figures below describe the bucket design only.
-
-Measured on an AMD Ryzen 9 5950X (32 CPUs, 31 GB RAM, NVMe, Fedora 44) under rootless podman. The container had `--memory=512m` with no swap, and `bucket_count` was 1024. The data was marshaled records, the way a client sends them. Unless a row says otherwise, the left side was Payment records and the right side BankLine records, both as protobuf, with 18-byte keys. Their values averaged 226 bytes and compress about 1.8 times with zstd. About 93% of keys had one record on each side. The spill directory was on btrfs with compression turned off. Every result was checked by a streaming verifier. The full method and tables, and the other profiles, are in [poc/POC-RESULTS.md](poc/POC-RESULTS.md).
-
-Earlier versions of these numbers used 1000-byte values that compress 52 times, on a directory that compressed the spill files, and a test client that slowed the join. POC-RESULTS compares them.
+Measured on an AMD Ryzen 9 5950X (32 CPUs, 31 GB RAM, NVMe, Fedora 44) under rootless podman, on 2026-11-18, in two passes that agreed to within a few percent in memory and 25% in time. The container had `--memory=512m` with no swap. The data was marshaled records, the way a client sends them. Unless a row says otherwise, the left side was Payment records and the right side BankLine records, both as protobuf, with 18-byte keys. Their values averaged 226 bytes and compress about 1.8 times with zstd. About 93% of keys had one record on each side. The data directory was on btrfs with compression turned off. Every result was checked by a streaming verifier. The full method and tables, the other profiles, and the comparison with the hash-bucket design this replaced are in [poc/POC-RESULTS.md](poc/POC-RESULTS.md).
 
 ### Throughput
 
-| Data | Scenario | Records | Ingest | Join | Ingest + join | Disk peak |
-|---|---|---|---|---|---|---|
-| Payment/BankLine, protobuf | 1 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 4.4 M | 7.7 s (133 MiB/s) | 2.2 s (472 MiB/s) | 9.9 s | 1,032 MiB |
-| Payment/BankLine, protobuf | 1 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 4.4 M | 6.6 s (155 MiB/s) | 2.7 s (381 MiB/s) | 9.3 s | 1,032 MiB |
-| Payment/BankLine, protobuf | 1 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 4.4 M | 4.9 s (210 MiB/s) | 2.5 s (405 MiB/s) | 7.4 s | 965 MiB |
-| Payment/BankLine, protobuf | 10 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 43.9 M | 70.7 s (145 MiB/s) | 23.4 s (437 MiB/s) | 94.1 s | 10,633 MiB |
-| Payment/BankLine, protobuf | 10 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 43.9 M | 64.8 s (158 MiB/s) | 22.3 s (458 MiB/s) | 87.1 s | 10,635 MiB |
-| Payment/BankLine, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 43.9 M | 61.1 s (167 MiB/s) | 23.1 s (444 MiB/s) | 84.1 s | 10,581 MiB |
-| Payment/BankLine, Avro | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 53.1 M | 65.9 s (155 MiB/s) | 24.5 s (417 MiB/s) | 90.5 s | 10,664 MiB |
-| Payment/BankLine, JSON | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 20.3 M | 49.3 s (208 MiB/s) | 15.9 s (645 MiB/s) | 65.1 s | 10,337 MiB |
-| CardSettlement, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 66.3 M | 73.1 s (140 MiB/s) | 28.8 s (356 MiB/s) | 101.9 s | 10,833 MiB |
-| Envelope, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 17.9 M | 46.0 s (223 MiB/s) | 15.3 s (670 MiB/s) | 61.3 s | 10,317 MiB |
-| Tiny, protobuf | 275 MiB, 128 MiB budget, `GOMEMLIMIT` unset | 7.0 M | 2.5 s (111 MiB/s) | 2.3 s (120 MiB/s) | 4.8 s | 314 MiB |
-| Tiny, protobuf | 275 MiB, 128 MiB budget, `GOMEMLIMIT` 90% | 7.0 M | 2.5 s (109 MiB/s) | 2.2 s (125 MiB/s) | 4.7 s | 310 MiB |
-| Old generator, 1000-byte values | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 10.5 M | 36.3 s (281 MiB/s) | 12.1 s (844 MiB/s) | 48.3 s | 10,171 MiB |
+| Data | Scenario | Records | Ingest | Seal | Join | Ingest + Seal + join | Run files | Disk peak |
+|---|---|---|---|---|---|---|---|---|
+| Payment/BankLine, protobuf | 1 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 4.4 M | 4.7 s (216 MiB/s) | 0.02 s | 2.5 s (409 MiB/s) | 7.3 s | 10 | 1,069 MiB |
+| Payment/BankLine, protobuf | 1 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 4.4 M | 4.7 s (218 MiB/s) | 0.01 s | 2.7 s (374 MiB/s) | 7.4 s | 10 | 1,069 MiB |
+| Payment/BankLine, protobuf | 1 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 4.4 M | 4.8 s (213 MiB/s) | 0.10 s | 2.6 s (400 MiB/s) | 7.5 s | 4 | 1,069 MiB |
+| Payment/BankLine, protobuf | 10 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 43.9 M | 46.9 s (218 MiB/s) | 0.03 s | 23.3 s (440 MiB/s) | 70.2 s | 92 | 10,688 MiB |
+| Payment/BankLine, protobuf | 10 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 43.9 M | 47.6 s (215 MiB/s) | 0.02 s | 23.7 s (432 MiB/s) | 71.2 s | 92 | 10,688 MiB |
+| Payment/BankLine, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 43.9 M | 48.0 s (213 MiB/s) | 0.55 s | 20.7 s (493 MiB/s) | 69.3 s | 32 | 10,688 MiB |
+| Payment/BankLine, Avro | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 53.1 M | 53.8 s (190 MiB/s) | 0.36 s | 24.1 s (424 MiB/s) | 78.3 s | 33 | 10,777 MiB |
+| Payment/BankLine, JSON | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 20.3 M | 32.1 s (319 MiB/s) | 0.13 s | 17.9 s (572 MiB/s) | 50.1 s | 31 | 10,450 MiB |
+| CardSettlement, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 66.3 M | 59.1 s (173 MiB/s) | 0.39 s | 24.1 s (425 MiB/s) | 83.6 s | 34 | 10,935 MiB |
+| Envelope, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 17.9 M | 28.8 s (355 MiB/s) | 0.06 s | 17.6 s (583 MiB/s) | 46.5 s | 31 | 10,430 MiB |
+| Tiny, protobuf | 275 MiB, 128 MiB budget, `GOMEMLIMIT` unset | 7.0 M | 2.1 s (132 MiB/s) | 0.21 s | 2.2 s (124 MiB/s) | 4.5 s | 4 | 342 MiB |
+| Tiny, protobuf | 275 MiB, 128 MiB budget, `GOMEMLIMIT` 90% | 7.0 M | 2.1 s (130 MiB/s) | 0.23 s | 2.1 s (129 MiB/s) | 4.5 s | 4 | 342 MiB |
+| Old generator, 1000-byte values | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 10.5 M | 21.2 s (481 MiB/s) | 0.15 s | 11.4 s (893 MiB/s) | 32.7 s | 30 | 10,287 MiB |
 
-Times are wall-clock as the client saw them, and throughput is the key and value bytes sent over that time. Ingest + join is the sidecar's share of a run. SealRun, which runs between the two, wasn't timed, and neither were CreateRun and DeleteRun. The client generated the data and verified every result on the same machine, and the join time includes that verification, so these times are upper bounds for the sidecar.
+Times are wall-clock as the client saw them, and throughput is the key and value bytes sent over that time. CreateRun and DeleteRun weren't timed. The client generated the data and verified every result on the same machine, and the join time includes that verification, so these times are upper bounds for the sidecar.
 
-- **The client can be the limit.** On the old 1000-byte values, a client that verified each result on the goroutine reading the Join stream measured the join at 544 and 554 MiB/s. The client used here verifies on 8 goroutines, and measured 771 and 844 MiB/s with the same data, image and data directory. Whether it limits the joins of realistic records wasn't measured.
-- **Smaller records cost more per byte.** The join ran at 1.2 to 2.3 M records/s for the realistic profiles. With Tiny records of 41 bytes of key and value, the cost per record dominates, at about 3 M records/s.
-- **The sidecar doesn't compress its spill files,** and the data directory here didn't either, so the disk peak is the space they took: 0.94 to 1.06 times the key and value bytes, and 1.13 to 1.14 times for Tiny records.
+- **Against the hash-bucket design,** on the same data and machine, ingest plus join took 13 to 32% less time at 10 GiB. Ingest took 16 to 42% less, most where the bucket design spilled most often (70.7 s against 46.9 s at 10 GiB under 128 MiB), except at 1 GiB under the default budget, which is only three budgets of data and took the same time. The join took about as long, within the noise. Files went from 149,652 to 92 at 10 GiB under 128 MiB, and from about 50,000 to about 32 at the default budget.
+- **Seal now writes** what a spilled run still holds as its last file: at most 0.55 s here. No run had enough files for Seal to merge any.
+- **The budget barely changed the time,** only the number of files: about one per 0.9 budgets of data.
+- **Smaller records cost more per byte.** The join ran at 1.0 to 2.8 M records/s for the realistic profiles. With Tiny records of 41 bytes of key and value, the cost per record dominates, at about 3.2 M records/s.
+- **The sidecar doesn't compress its run files,** and the data directory here didn't either, so the disk peak is the space they took: 1.02 to 1.07 times the key and value bytes, and 1.24 times for Tiny records. Every byte is on disk by Seal, and a Join writes nothing.
 
 In a real pipeline, reading the source can overlap with Ingest, and processing results can overlap with Join, because both stream in batches. Each step then takes about as long as the slower of the two sides.
 
@@ -351,21 +349,18 @@ In a real pipeline, reading the source can overlap with Ingest, and processing r
 
 | Scenario | Budget | Pool peak | Peak RSS (VmHWM) | RSS / container limit |
 |---|---|---|---|---|
-| 1 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 128 MiB | 128.0 MiB | 314 MiB | 61% |
-| 10 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 128 MiB | 128.0 MiB | 366 MiB | 71% |
-| 1 GiB, default budget, `GOMEMLIMIT` unset | 358 MiB | **OOM-killed 1.6 s into ingest** | | |
-| 10 GiB, default budget, `GOMEMLIMIT` unset | 358 MiB | **OOM-killed 1.0 s into ingest** | | |
-| 1 GiB, default budget, `GOMEMLIMIT` 90% | 358 MiB | 358.4 MiB | 454 MiB | 89% |
-| 10 GiB, default budget, `GOMEMLIMIT` 90% | 358 MiB | 358.4 MiB | 458 MiB | 89% |
+| 1 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 128 MiB | 127.7 MiB | 317 MiB | 62% |
+| 10 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 128 MiB | 128.0 MiB | 366 MiB | 72% |
+| 1 GiB, default budget, `GOMEMLIMIT` unset | 358 MiB | **OOM-killed 1.7 s into ingest** | | |
+| 10 GiB, default budget, `GOMEMLIMIT` unset | 358 MiB | **OOM-killed 1.9 s into ingest** | | |
+| 1 GiB, default budget, `GOMEMLIMIT` 90% | 358 MiB | 358.4 MiB | 465 MiB | 91% |
+| 10 GiB, default budget, `GOMEMLIMIT` 90% | 358 MiB | 358.4 MiB | 462 MiB | 90% |
 
 - **The reservation accounting holds.** The pool's peak reached the budget in every run and never went over it.
-- **Go's garbage collector is the gap.** With `GOMEMLIMIT` unset, the peak resident set was 2.4 to 2.9 times the pool peak. That is the GC's default heap headroom (`GOGC=100`), and it makes the proposal's default budget of 70% of the container limit unworkable.
-- **`GOMEMLIMIT` at 90% of the limit closes the gap,** with no measurable loss of throughput. The runtime holds the process at about the soft limit, and about 10% of the container is left for stacks, the binary and gRPC buffers. Every default-budget run with it completed, for every profile and encoding, at 88 to 91% of the container limit. The POC doesn't set `GOMEMLIMIT` itself.
-- **Backpressure works.** A client reading at 5 MiB/s pulled 1.1 GiB of results from a 256 MiB container with a 64 MiB budget, over 3 min 40 s. The container was never OOM-killed.
-
-### Expansion factor (bucket design)
-
-In the bucket design, a join unit's working set was 1.03 to 1.17 times its record bytes for the realistic profiles, 1.02 times for the old 1000-byte values, and up to 1.40 times for Tiny records of about 51 encoded bytes. Sorted runs have no join units and no planning factor: a Join holds one key at a time per worker.
+- **Go's garbage collector is the gap.** With `GOMEMLIMIT` unset, the peak resident set was 2.3 to 2.9 times the pool peak. That is the GC's default heap headroom (`GOGC=100`), and it makes the proposal's default budget of 70% of the container limit unworkable. The design doesn't change this; the bucket design measured the same.
+- **`GOMEMLIMIT` at 90% of the limit closes the gap,** with no measurable loss of throughput. The runtime holds the process at about the soft limit, and about 9% of the container is left for stacks, the binary and gRPC buffers. Every default-budget run with it completed, for every profile and encoding, at 90 to 91% of the container limit. The POC doesn't set `GOMEMLIMIT` itself.
+- **The join holds read buffers, not the data:** 63 MiB for 92 files at 10 GiB under 128 MiB, and 30 to 34 MiB for about 32 files at the default budget, with 4 workers.
+- **Backpressure works.** A client reading at 5 MiB/s pulled 1.1 GiB of results from a 256 MiB container with a 64 MiB budget, over 3 min 40 s. The container was never OOM-killed, and the pool peaked within the budget.
 
 ## Known limitations
 
@@ -375,7 +370,7 @@ In the bucket design, a join unit's working set was 1.03 to 1.17 times its recor
 - **Joins of different runs share one pool.** Each sizes its read buffers from what the pool has free, so Joins at once read with smaller buffers, and can still fail with `MEMORY_EXHAUSTED` under a small budget. That is retryable, and the run stays `SEALED`.
 - **A `Match` of many tiny values** within `RECON_MAX_MATCH_BYTES` can take more memory than its encoded size: 24 bytes per value besides the value. One that doesn't fit the pool fails with `MEMORY_EXHAUSTED`.
 - **A Join blocked by a client that stopped reading** is cancelled by `DeleteRun` at once, and DeleteRun doesn't wait for it, but the Join's goroutine ends only once the client reads again or disconnects.
-- **Not measured on this code yet:** the evaluation's benchmarks ran on its prototype. Several runs sharing a pool, a real network volume and skewed keys at benchmark scale remain to be measured.
+- **Not measured yet:** several runs sharing a pool, a real network volume, skewed keys at benchmark scale, and data far enough over the budget for Seal to merge files or the Join to give up workers.
 
 ## Deviations from the proposal
 

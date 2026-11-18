@@ -76,7 +76,7 @@ func TestMeasure(t *testing.T) {
 	for _, p := range []*gen.Schema{gen.CardSettlement, gen.Envelope} {
 		add(profiles(p, p, gen.Protobuf), "10GiB", 10<<30, defaultOnly, limitOnly)
 	}
-	// Small records, whose index entries and chunk slack weigh more.
+	// Small records, whose cost per record dominates.
 	add(profiles(gen.Tiny, gen.Tiny, gen.Protobuf), "275MiB", 275<<20, []string{"128MiB"}, []string{"", goMemMax})
 	// The old generator with the old settings, to compare with the earlier
 	// results: about 10 GiB of 1000-byte values in the stress mix. In the
@@ -178,11 +178,13 @@ type measurement struct {
 	DataFS harness.Filesystem // of the container's data directory
 
 	IngestSeconds  float64
+	SealSeconds    float64 // a run that spilled writes its last file and may merge files
 	JoinSeconds    float64
-	SpillFiles     int // after Seal
+	SpillFiles     int // run files after Seal
 	SpillBytes     int64
 	BudgetBytes    int64
 	Parallelism    int64
+	RunSealed      map[string]any // the run sealed record's attributes
 	JoinFinished   map[string]any // the join finished record's attributes
 	VmHWMBytes     int64          // the sidecar's peak resident set
 	CgroupPeak     int64          // memory.peak of the container's cgroup, page cache included
@@ -285,8 +287,15 @@ func measure(t *testing.T, name string, cfg gen.Config, target int64, opts ...ha
 	if records != m.Records {
 		t.Errorf("the Ingest streams were given %d records, want the run's %d", records, m.Records)
 	}
+	start = time.Now()
 	seal(ctx, t, c, id)
+	m.SealSeconds = time.Since(start).Seconds()
 	m.SpillFiles, m.SpillBytes = spillFiles(t, c, id)
+	for _, r := range c.Logs() {
+		if r.Body == "run sealed" && r.Attributes["recon.run_id"] == id.GetValue() {
+			m.RunSealed = r.Attributes
+		}
+	}
 
 	start = time.Now()
 	v := gen.NewVerifier(cfg)
