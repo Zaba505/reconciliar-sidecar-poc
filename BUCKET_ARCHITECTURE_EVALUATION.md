@@ -215,6 +215,8 @@ On a disk throttled like a network volume the designs converge at a 128 MiB budg
 
 So the speed lead holds where the disk is fast or the budget is tight. At a 128 MiB budget on a slow volume, the case for sorted runs is what it removes and what it survives, not time.
 
+The throttle matched a gp3 volume's baseline rates, but not request latency, node bandwidth limits or NFS file operations. [Spill storage on Kubernetes volumes](SPILL_STORAGE_RESEARCH.md) compares it with the published limits of EBS, Persistent Disk, Hyperdisk, EFS, Filestore and local NVMe.
+
 ## Recommended architecture in detail
 
 Sorted runs replace the bucket with one mechanism: when the budget fills, sort what is in memory, write it as one file, and merge the files at Join.
