@@ -4,6 +4,8 @@ Nov 16, 2026
 
 > Markdown copy of the evaluation report. The report's two charts are given here as tables, and its diagram as Mermaid.
 
+> **Adopted, Nov 18, 2026.** The POC now implements sorted runs with a streaming merge join (commit `fdedbb0`), with the six [conditions for adoption](#conditions-for-adoption) built and tested; the README maps each to its tests. Remeasured on the POC itself ([poc/POC-RESULTS.md](poc/POC-RESULTS.md)), 10 GiB under a 128 MiB budget ingested in 46.9 s against 70.7 s for the bucket design and wrote 92 run files against 149,652, with the join taking about as long. [PROPOSAL.md](PROPOSAL.md) §8 and §18 and [PLAN.md](PLAN.md) were rewritten to match. Of the [next steps](#risks-open-questions-and-next-steps), still open: read-ahead for the join at high fan-in, and measurements on a real network volume, with several runs sharing a pool, and with skewed keys at benchmark scale; and the open question of spill compression. The report below is unchanged.
+
 ## Recommendation
 
 Adopt sorted runs with a streaming merge join. At 10 GiB under a 128 MiB memory budget it finishes ingest plus join in 50 s against 73 s for the current design, writes 92 files instead of 150,716, and holds that time when page cache is scarce.
