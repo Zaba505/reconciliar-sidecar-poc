@@ -315,25 +315,25 @@ RECON_E2E_IMAGE=recon-sidecar:dev RECON_E2E_DATA_ROOT=/var/tmp/recon-e2e-nocomp 
 
 ## Performance
 
-Measured on an AMD Ryzen 9 5950X (32 CPUs, 31 GB RAM, NVMe, Fedora 44) under rootless podman, on 2026-11-18, in two passes that agreed to within a few percent in memory and 25% in time. The container had `--memory=512m` with no swap. The data was marshaled records, the way a client sends them. Unless a row says otherwise, the left side was Payment records and the right side BankLine records, both as protobuf, with 18-byte keys. Their values averaged 226 bytes and compress about 1.8 times with zstd. About 93% of keys had one record on each side. A scenario's size is the key and value bytes of both sides together, and both sides had the same number of records: since a Payment record is larger, the left side held 57% of the bytes as protobuf (5.71 GiB against 4.28 GiB at 10 GiB), 59% as Avro and 60% as JSON, while the single-profile rows split 50/50. The data directory was on btrfs with compression turned off. Every result was checked by a streaming verifier. The full method and tables, the other profiles, and the comparison with the hash-bucket design this replaced are in [poc/POC-RESULTS.md](poc/POC-RESULTS.md).
+Measured on an AMD Ryzen 9 5950X (32 CPUs, 31 GB RAM, NVMe, Fedora 44) under rootless podman, on 2026-11-18, in two passes that agreed to within a few percent in memory and 25% in time. The container had `--memory=512m` with no swap. The data was marshaled records, the way a client sends them. Unless a row says otherwise, the left side was Payment records and the right side BankLine records, both as protobuf, with 18-byte keys. Their values averaged 226 bytes and compress about 1.8 times with zstd. About 93% of keys had one record on each side. A scenario's size is the key and value bytes of both sides together; the Left and Right columns show how it splits. Both sides have the same number of records, so a Payment/BankLine run puts more of its bytes on the left, where the records are larger. The data directory was on btrfs with compression turned off. Every result was checked by a streaming verifier. The full method and tables, the other profiles, and the comparison with the hash-bucket design this replaced are in [poc/POC-RESULTS.md](poc/POC-RESULTS.md).
 
 ### Throughput
 
-| Data | Scenario | Records | Ingest | Seal | Join | Ingest + Seal + join | Run files | Disk peak |
-|---|---|---|---|---|---|---|---|---|
-| Payment/BankLine, protobuf | 1 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 4.4 M | 4.7 s (216 MiB/s) | 0.02 s | 2.5 s (409 MiB/s) | 7.3 s | 10 | 1,069 MiB |
-| Payment/BankLine, protobuf | 1 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 4.4 M | 4.7 s (218 MiB/s) | 0.01 s | 2.7 s (374 MiB/s) | 7.4 s | 10 | 1,069 MiB |
-| Payment/BankLine, protobuf | 1 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 4.4 M | 4.8 s (213 MiB/s) | 0.10 s | 2.6 s (400 MiB/s) | 7.5 s | 4 | 1,069 MiB |
-| Payment/BankLine, protobuf | 10 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 43.9 M | 46.9 s (218 MiB/s) | 0.03 s | 23.3 s (440 MiB/s) | 70.2 s | 92 | 10,688 MiB |
-| Payment/BankLine, protobuf | 10 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 43.9 M | 47.6 s (215 MiB/s) | 0.02 s | 23.7 s (432 MiB/s) | 71.2 s | 92 | 10,688 MiB |
-| Payment/BankLine, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 43.9 M | 48.0 s (213 MiB/s) | 0.55 s | 20.7 s (493 MiB/s) | 69.3 s | 32 | 10,688 MiB |
-| Payment/BankLine, Avro | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 53.1 M | 53.8 s (190 MiB/s) | 0.36 s | 24.1 s (424 MiB/s) | 78.3 s | 33 | 10,777 MiB |
-| Payment/BankLine, JSON | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 20.3 M | 32.1 s (319 MiB/s) | 0.13 s | 17.9 s (572 MiB/s) | 50.1 s | 31 | 10,450 MiB |
-| CardSettlement, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 66.3 M | 59.1 s (173 MiB/s) | 0.39 s | 24.1 s (425 MiB/s) | 83.6 s | 34 | 10,935 MiB |
-| Envelope, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 17.9 M | 28.8 s (355 MiB/s) | 0.06 s | 17.6 s (583 MiB/s) | 46.5 s | 31 | 10,430 MiB |
-| Tiny, protobuf | 275 MiB, 128 MiB budget, `GOMEMLIMIT` unset | 7.0 M | 2.1 s (132 MiB/s) | 0.21 s | 2.2 s (124 MiB/s) | 4.5 s | 4 | 342 MiB |
-| Tiny, protobuf | 275 MiB, 128 MiB budget, `GOMEMLIMIT` 90% | 7.0 M | 2.1 s (130 MiB/s) | 0.23 s | 2.1 s (129 MiB/s) | 4.5 s | 4 | 342 MiB |
-| Old generator, 1000-byte values | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 10.5 M | 21.2 s (481 MiB/s) | 0.15 s | 11.4 s (893 MiB/s) | 32.7 s | 30 | 10,287 MiB |
+| Data (left / right) | Scenario (total size, budget, `GOMEMLIMIT`) | Left side | Right side | Ingest | Seal | Join | Ingest + Seal + join | Run files | Disk peak |
+|---|---|---|---|---|---|---|---|---|---|
+| Payment/BankLine, protobuf | 1 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 2.20 M records, 585 MiB (57%) | 2.20 M records, 438 MiB (43%) | 4.7 s (216 MiB/s) | 0.02 s | 2.5 s (409 MiB/s) | 7.3 s | 10 | 1,069 MiB |
+| Payment/BankLine, protobuf | 1 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 2.20 M records, 585 MiB (57%) | 2.20 M records, 438 MiB (43%) | 4.7 s (218 MiB/s) | 0.01 s | 2.7 s (374 MiB/s) | 7.4 s | 10 | 1,069 MiB |
+| Payment/BankLine, protobuf | 1 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 2.20 M records, 585 MiB (57%) | 2.20 M records, 438 MiB (43%) | 4.8 s (213 MiB/s) | 0.10 s | 2.6 s (400 MiB/s) | 7.5 s | 4 | 1,069 MiB |
+| Payment/BankLine, protobuf | 10 GiB, 128 MiB budget, `GOMEMLIMIT` unset | 21.96 M records, 5.71 GiB (57%) | 21.97 M records, 4.28 GiB (43%) | 46.9 s (218 MiB/s) | 0.03 s | 23.3 s (440 MiB/s) | 70.2 s | 92 | 10,688 MiB |
+| Payment/BankLine, protobuf | 10 GiB, 128 MiB budget, `GOMEMLIMIT` 90% | 21.96 M records, 5.71 GiB (57%) | 21.97 M records, 4.28 GiB (43%) | 47.6 s (215 MiB/s) | 0.02 s | 23.7 s (432 MiB/s) | 71.2 s | 92 | 10,688 MiB |
+| Payment/BankLine, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 21.96 M records, 5.71 GiB (57%) | 21.97 M records, 4.28 GiB (43%) | 48.0 s (213 MiB/s) | 0.55 s | 20.7 s (493 MiB/s) | 69.3 s | 32 | 10,688 MiB |
+| Payment/BankLine, Avro | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 26.57 M records, 5.88 GiB (59%) | 26.57 M records, 4.11 GiB (41%) | 53.8 s (190 MiB/s) | 0.36 s | 24.1 s (424 MiB/s) | 78.3 s | 33 | 10,777 MiB |
+| Payment/BankLine, JSON | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 10.16 M records, 5.99 GiB (60%) | 10.16 M records, 4.01 GiB (40%) | 32.1 s (319 MiB/s) | 0.13 s | 17.9 s (572 MiB/s) | 50.1 s | 31 | 10,450 MiB |
+| CardSettlement, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 33.17 M records, 5.00 GiB (50%) | 33.17 M records, 5.00 GiB (50%) | 59.1 s (173 MiB/s) | 0.39 s | 24.1 s (425 MiB/s) | 83.6 s | 34 | 10,935 MiB |
+| Envelope, protobuf | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 8.95 M records, 5.00 GiB (50%) | 8.95 M records, 5.00 GiB (50%) | 28.8 s (355 MiB/s) | 0.06 s | 17.6 s (583 MiB/s) | 46.5 s | 31 | 10,430 MiB |
+| Tiny, protobuf | 275 MiB, 128 MiB budget, `GOMEMLIMIT` unset | 3.49 M records, 138 MiB (50%) | 3.49 M records, 138 MiB (50%) | 2.1 s (132 MiB/s) | 0.21 s | 2.2 s (124 MiB/s) | 4.5 s | 4 | 342 MiB |
+| Tiny, protobuf | 275 MiB, 128 MiB budget, `GOMEMLIMIT` 90% | 3.49 M records, 138 MiB (50%) | 3.49 M records, 138 MiB (50%) | 2.1 s (130 MiB/s) | 0.23 s | 2.1 s (129 MiB/s) | 4.5 s | 4 | 342 MiB |
+| Old generator, 1000-byte values | 10 GiB, 358 MiB budget (default), `GOMEMLIMIT` 90% | 5.25 M records, 4.97 GiB (50%) | 5.25 M records, 4.97 GiB (50%) | 21.2 s (481 MiB/s) | 0.15 s | 11.4 s (893 MiB/s) | 32.7 s | 30 | 10,287 MiB |
 
 Times are wall-clock as the client saw them, and throughput is the key and value bytes sent over that time. CreateRun and DeleteRun weren't timed. The client generated the data and verified every result on the same machine, and the join time includes that verification, so these times are upper bounds for the sidecar.
 
