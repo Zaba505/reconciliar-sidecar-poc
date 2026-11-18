@@ -28,7 +28,7 @@ func initForTest(cgroup string) func(context.Context, *humus.Setup) ([]humus.Ser
 func TestInit_serves_probes_and_the_API(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newTestEnv(t)
-		if err := os.WriteFile(e.host.Path("data/stale.rec"), []byte("old"), 0o644); err != nil {
+		if err := os.WriteFile(e.host.Path("data/stale.run"), []byte("old"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		tel := humustest.NewTelemetry()

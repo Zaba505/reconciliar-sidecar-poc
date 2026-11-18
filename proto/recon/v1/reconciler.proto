@@ -29,7 +29,9 @@ service Reconciler {
   rpc Ingest(stream IngestRequest) returns (IngestResponse);
 
   // Ends ingest for both sides and returns control totals. This is the only
-  // point where the sides are synchronized. Idempotent.
+  // point where the sides are synchronized. Idempotent. A run that spilled
+  // writes its last records to disk here; if that fails, with DISK_EXHAUSTED
+  // say, the run stays open with every record, and SealRun may be retried.
   rpc SealRun(SealRunRequest) returns (SealRunResponse);
 
   // Streams the full outer join of a sealed run, in no particular order. The
@@ -78,9 +80,9 @@ message RecordBatch {
 // ---------------------------------------------------------------------------
 
 message CreateRunRequest {
-  // Required. Number of hash buckets, from 1 to the sidecar's maximum.
-  // There is no default: size it from the expected data volume. Small
-  // buckets are coalesced at join time, so erring high is cheap.
+  // Required, from 1 to the sidecar's maximum, and otherwise ignored: the
+  // sidecar sorts records instead of partitioning them into buckets, so
+  // nothing needs sizing to the data.
   uint32 bucket_count = 1;
 }
 
@@ -191,7 +193,7 @@ enum ErrorReason {
   ERROR_REASON_MEMORY_EXHAUSTED = 7;     // RESOURCE_EXHAUSTED
   ERROR_REASON_DISK_EXHAUSTED = 8;       // RESOURCE_EXHAUSTED
   ERROR_REASON_TOO_MANY_RUNS = 9;        // RESOURCE_EXHAUSTED
-  ERROR_REASON_HOT_KEY = 10;             // RESOURCE_EXHAUSTED
+  ERROR_REASON_HOT_KEY = 10;             // RESOURCE_EXHAUSTED (a Match over the maximum match size)
 }
 
 message ReconError {

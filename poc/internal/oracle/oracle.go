@@ -96,16 +96,25 @@ func State(r *reconv1.JoinResult) reconv1.JoinState {
 
 // Canonical encodes r so that two results are equal exactly when their
 // encodings are: its state, key and values, with the values of a Match
-// sorted, since their order follows ingest order (§8.3).
-func Canonical(r *reconv1.JoinResult) []byte {
+// sorted, since their order follows ingest order (§8.3), which concurrent
+// streams interleave.
+func Canonical(r *reconv1.JoinResult) []byte { return canonical(r, true) }
+
+// Ordered encodes r as Canonical does, but with the values of a Match in
+// their order: for runs ingested on one stream, whose order is defined.
+func Ordered(r *reconv1.JoinResult) []byte { return canonical(r, false) }
+
+func canonical(r *reconv1.JoinResult, sorted bool) []byte {
 	b := []byte{byte(State(r))}
 	field := func(v []byte) {
 		b = binary.AppendUvarint(b, uint64(len(v)))
 		b = append(b, v...)
 	}
 	values := func(vs [][]byte) {
-		vs = slices.Clone(vs)
-		slices.SortFunc(vs, bytes.Compare)
+		if sorted {
+			vs = slices.Clone(vs)
+			slices.SortFunc(vs, bytes.Compare)
+		}
 		b = binary.AppendUvarint(b, uint64(len(vs)))
 		for _, v := range vs {
 			field(v)
@@ -143,13 +152,19 @@ func Filter(results []*reconv1.JoinResult, states ...reconv1.JoinState) []*recon
 
 // Diff compares want and got as multisets of canonical results, and
 // describes how they differ, or returns "" if they are equal.
-func Diff(want, got []*reconv1.JoinResult) string {
+func Diff(want, got []*reconv1.JoinResult) string { return diff(want, got, Canonical) }
+
+// DiffOrdered is Diff with the values of each Match in order, as Ordered
+// encodes them.
+func DiffOrdered(want, got []*reconv1.JoinResult) string { return diff(want, got, Ordered) }
+
+func diff(want, got []*reconv1.JoinResult, enc func(*reconv1.JoinResult) []byte) string {
 	counts := map[string]int{}
 	for _, r := range want {
-		counts[string(Canonical(r))]++
+		counts[string(enc(r))]++
 	}
 	for _, r := range got {
-		counts[string(Canonical(r))]--
+		counts[string(enc(r))]--
 	}
 	var missing, extra int
 	var examples []string

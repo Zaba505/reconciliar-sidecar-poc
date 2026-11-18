@@ -15,7 +15,7 @@ import (
 
 	"poc/e2e/gen"
 	"poc/e2e/harness"
-	"poc/internal/buffer"
+	"poc/internal/record"
 )
 
 // records yields rs.
@@ -122,7 +122,7 @@ func protoBlocks(data []byte, size int) [][]byte {
 	for off < len(data) {
 		kl, n := binary.Uvarint(data[off+8:])
 		vl, m := binary.Uvarint(data[off+8+n:])
-		next := off + 8 + n + m + int(kl) + int(vl)
+		next := off + 8 + n + m + int(kl>>1) + int(vl) // the key length's low bit is the side
 		if next-start > size && off > start {
 			out = append(out, data[start:off])
 			start = off
@@ -157,11 +157,7 @@ func TestSample_compresses_each_side_in_blocks_as_the_prototype_does(t *testing.
 	// Encode each side's records as one stream, then split and compress it.
 	var data [2][]byte
 	for _, rec := range rs {
-		var hash uint64
-		if len(rec.Key) > 0 {
-			hash = buffer.Hash(rec.Key)
-		}
-		data[rec.Side-1] = buffer.AppendRecord(data[rec.Side-1], hash, rec.Key, rec.Value)
+		data[rec.Side-1] = record.Append(data[rec.Side-1], record.Hash(rec.Key), record.Side(rec.Side-1), rec.Key, rec.Value)
 	}
 	zenc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithEncoderConcurrency(1))
 	if err != nil {

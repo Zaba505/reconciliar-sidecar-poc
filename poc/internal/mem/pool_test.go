@@ -74,6 +74,7 @@ type fake struct {
 	name    string
 	size    int64
 	pinned  bool
+	idle    bool // a spill puts the memory on the idle list
 	err     error
 	spilled *[]string
 }
@@ -90,7 +91,11 @@ func (f *fake) Spill() error {
 		return f.err
 	}
 	*f.spilled = append(*f.spilled, f.name)
-	f.p.Release(f.size)
+	if f.idle {
+		f.p.PutIdle(nil, f.size)
+	} else {
+		f.p.Release(f.size)
+	}
 	f.size = 0
 	return nil
 }
@@ -280,5 +285,84 @@ func TestPool_concurrent_reservers_spill_and_stay_within_the_limit(t *testing.T)
 	}
 	if p.Peak() > p.Limit() {
 		t.Errorf("Peak = %d, above the limit", p.Peak())
+	}
+}
+
+func TestPool_idle_buffers_stay_reserved_until_a_reservation_needs_them(t *testing.T) {
+	p := NewPool(100)
+	if err := p.Reserve(60); err != nil {
+		t.Fatal(err)
+	}
+	p.PutIdle(make([]byte, 10), 20)
+	p.PutIdle(make([]byte, 30), 40)
+	p.Release(0)
+	if p.Used() != 60 || p.Idle() != 60 {
+		t.Fatalf("Used %d, Idle %d; want both 60: the idle buffers took over the reservation", p.Used(), p.Idle())
+	}
+	if buf, n := p.TakeIdle(10); len(buf) != 10 || n != 20 || p.Idle() != 40 || p.Used() != 60 {
+		t.Fatalf("TakeIdle(10) = %d bytes, %d reserved; Idle %d, Used %d", len(buf), n, p.Idle(), p.Used())
+	}
+	if buf, _ := p.TakeIdle(11); buf != nil {
+		t.Error("TakeIdle of a size nothing idle has returned a buffer")
+	}
+	// 60 in use, 40 of it idle: a reservation of 70 fits once the idle
+	// buffer is dropped, without spilling.
+	spilled := new([]string)
+	p.SetSource(func() []Spillable { return []Spillable{&fake{p: p, name: "x", spilled: spilled}} })
+	if err := p.Reserve(70); err != nil {
+		t.Fatalf("Reserve with idle buffers to drop: %v", err)
+	}
+	if p.Idle() != 0 || p.Used() != 90 || len(*spilled) != 0 {
+		t.Errorf("Idle %d, Used %d, spilled %v; want the idle buffer dropped and nothing spilled", p.Idle(), p.Used(), *spilled)
+	}
+}
+
+func TestPool_Release_of_idle_memory_panics(t *testing.T) {
+	p := NewPool(100)
+	if err := p.Reserve(10); err != nil {
+		t.Fatal(err)
+	}
+	p.PutIdle(nil, 10)
+	defer func() {
+		if recover() == nil {
+			t.Error("Release of a reservation that passed to an idle buffer didn't panic")
+		}
+	}()
+	p.Release(10)
+}
+
+func TestPool_spilling_doesnt_count_idle_buffers(t *testing.T) {
+	p := NewPool(1000)
+	fs, spilled := fakes(t, p, 300, 300)
+	// A spill that moves its memory to the idle list releases nothing, yet
+	// brings what is in use under the low-water mark.
+	for _, f := range fs {
+		f.idle = true
+	}
+	if err := p.Reserve(390); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Reserve(100); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if want := []string{"a"}; !slices.Equal(*spilled, want) {
+		t.Errorf("spilled %v, want %v: one spill makes room once its idle buffer is dropped", *spilled, want)
+	}
+	if p.Used() > p.Limit() {
+		t.Errorf("Used %d, above the limit", p.Used())
+	}
+}
+
+func TestPool_TryReserve_doesnt_spill(t *testing.T) {
+	p := NewPool(100)
+	_, spilled := fakes(t, p, 90)
+	if p.TryReserve(20) {
+		t.Error("TryReserve past the limit succeeded")
+	}
+	if len(*spilled) != 0 {
+		t.Errorf("TryReserve spilled %v", *spilled)
+	}
+	if !p.TryReserve(10) || p.Used() != 100 {
+		t.Errorf("TryReserve up to the limit: Used %d", p.Used())
 	}
 }

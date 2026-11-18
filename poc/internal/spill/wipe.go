@@ -1,4 +1,3 @@
-// Package spill holds the sidecar's spill files on its data directory.
 package spill
 
 import (

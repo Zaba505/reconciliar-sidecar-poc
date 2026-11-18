@@ -22,12 +22,12 @@ import (
 
 const reasonDisk = reconv1.ErrorReason_ERROR_REASON_DISK_EXHAUSTED
 
-// spillFiles returns the number and total size of the spill files in a
+// spillFiles returns the number and total size of the run files in a
 // run's directory.
 func spillFiles(t *testing.T, c *harness.Container, id *reconv1.RunId) (files int, bytes int64) {
 	t.Helper()
 	err := filepath.WalkDir(runDir(c, id), func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".rec") {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".run") {
 			return err
 		}
 		info, err := d.Info()
@@ -121,9 +121,9 @@ func TestLargerThanMemory(t *testing.T) {
 	start := time.Now()
 	ingestGen(ctx, t, c, id, cfg, 4)
 	files, bytes := spillFiles(t, c, id)
-	t.Logf("ingested in %v: %d spill files, %d MiB", time.Since(start).Round(time.Second), files, bytes>>20)
-	if files == 0 || bytes < 1<<30 {
-		t.Fatalf("%d spill files of %d MiB after Seal; most of 2 GiB must spill under a 128 MiB budget", files, bytes>>20)
+	t.Logf("ingested in %v: %d run files, %d MiB", time.Since(start).Round(time.Second), files, bytes>>20)
+	if files == 0 || bytes < 2<<30 {
+		t.Fatalf("%d run files of %d MiB after Seal; all of 2 GiB must spill under a 128 MiB budget", files, bytes>>20)
 	}
 
 	start = time.Now()
@@ -137,17 +137,19 @@ func TestLargerThanMemory(t *testing.T) {
 	if !ok || peak > budget || peak == 0 {
 		t.Errorf("join finished record reports pool peak %d (%v), want 1 to %d", peak, ok, budget)
 	}
-	t.Logf("pool peak %d MiB, %v units", peak>>20, rec.Attributes["recon.join_units"])
+	t.Logf("pool peak %d MiB, %v files, %v workers, read buffers of %v bytes", peak>>20, rec.Attributes["recon.join_files"], rec.Attributes["recon.join_workers"], rec.Attributes["recon.join_read_buffer_bytes"])
 	deleteRun(ctx, t, c, id)
 	wantNoRunDir(t, c, id)
 }
 
+// TestBudgetInvariance joins one run's records under budgets that hold
+// them and budgets that don't, with one worker and four, and with bucket
+// counts the sidecar accepts and ignores: the results are the same.
 func TestBudgetInvariance(t *testing.T) {
 	t.Parallel()
 	ctx := testContext(t)
-	// About 20 MiB, so that every bucket count joins within 32 MiB, while
-	// 4096 buckets of 4 KiB first chunks per side don't fit in it.
-	cfg := gen.Config{Seed: 8, Keys: 6_800, ValueSize: 1000}
+	// About 40 MiB, so that it spills under 32 MiB.
+	cfg := gen.Config{Seed: 8, Keys: 13_600, ValueSize: 1000}
 	type result struct {
 		name string
 		fp   gen.Fingerprint
@@ -168,15 +170,14 @@ func TestBudgetInvariance(t *testing.T) {
 				id := create(ctx, t, c, n)
 				ingestGen(ctx, t, c, id, cfg, 2)
 				files, bytes := spillFiles(t, c, id)
-				if b.tiny && n == 4096 && files == 0 {
-					t.Errorf("%s: nothing spilled during ingest", name)
+				if b.tiny == (files == 0) {
+					t.Errorf("%s: %d run files after Seal, want them only under the tiny budget", name, files)
 				}
 				fp := verifiedJoin(ctx, t, c, id, cfg)
-				units, _ := joinFinished(t, c, id).Int("recon.join_units")
-				if b.tiny && n == 4096 && (units < 2 || units >= int64(n)) {
-					t.Errorf("%s: %d join units, want the buckets coalesced into a few", name, units)
-				}
-				t.Logf("%s: %d spill files (%d KiB) after Seal, %d units", name, files, bytes>>10, units)
+				rec := joinFinished(t, c, id)
+				workers, _ := rec.Int("recon.join_workers")
+				blocks, _ := rec.Int("recon.join_blocks")
+				t.Logf("%s: %d run files (%d KiB) after Seal, %d blocks in memory, %d workers", name, files, bytes>>10, blocks, workers)
 				results = append(results, result{name, fp})
 				deleteRun(ctx, t, c, id)
 			}

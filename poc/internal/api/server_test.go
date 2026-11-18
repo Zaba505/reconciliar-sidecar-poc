@@ -60,13 +60,15 @@ func TestToStatus(t *testing.T) {
 }
 
 func TestToStatus_HOT_KEY_names_the_key(t *testing.T) {
-	err := fmt.Errorf("join: %w", &join.HotKeyError{Key: []byte("N/A"), Left: 3, Right: 4})
+	hk := &join.HotKeyError{Key: []byte("N/A"), Left: 3, Right: 4, Size: 3000, Limit: 1024}
+	err := fmt.Errorf("join: %w", hk)
 	st := status.Convert(toStatus(err))
 	if st.Code() != codes.ResourceExhausted {
 		t.Errorf("code %v, want ResourceExhausted", st.Code())
 	}
 	want := &reconv1.ReconError{
 		Reason: reconv1.ErrorReason_ERROR_REASON_HOT_KEY,
+		Detail: hk.Error(),
 		HotKey: &reconv1.HotKey{Key: []byte("N/A"), LeftRecords: 3, RightRecords: 4},
 	}
 	if d := st.Details(); len(d) != 1 || !proto.Equal(d[0].(proto.Message), want) {

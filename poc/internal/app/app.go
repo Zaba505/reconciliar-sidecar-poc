@@ -46,7 +46,7 @@ func initWith(ctx context.Context, s *humus.Setup, cgroupFile string) ([]humus.S
 
 	log := otelslog.NewLogger(loggerName, otelslog.WithLoggerProvider(s.Telemetry.LoggerProvider))
 	pool := mem.NewPool(cfg.MemoryLimit)
-	runs := run.NewManager(s.Host.FS, pool, spill.NewDisk(s.Host.FS, cfg.DiskLimit), run.Config{
+	runs, err := run.NewManager(s.Host.FS, pool, spill.NewDisk(s.Host.FS, cfg.DiskLimit), run.Config{
 		DataDir:          cfg.DataDir,
 		MaxRuns:          cfg.MaxRuns,
 		MaxBuckets:       cfg.MaxBuckets,
@@ -55,6 +55,9 @@ func initWith(ctx context.Context, s *humus.Setup, cgroupFile string) ([]humus.S
 		MaxMatchBytes:    cfg.MaxMatchBytes,
 		Logger:           log,
 	})
+	if err != nil {
+		return nil, err
+	}
 	s.OnStop(runs.Close)
 
 	svc, err := grpcserver.NewService(s, cfg.GRPC, grpc.MaxRecvMsgSize(cfg.MaxRecvMessageBytes))

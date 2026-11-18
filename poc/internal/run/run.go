@@ -3,14 +3,16 @@
 //
 // A run is OPEN until it is sealed (SEALED) or an ingest stream that had
 // records accepted fails (FAILED). The state is guarded by a per-run
-// mutex. Deleting a run cancels the contexts of its open streams with
-// ErrAborted, so that they end.
+// mutex. Deleting a run cancels the contexts of its open streams, and of
+// a Join in progress, with ErrAborted, so that they end.
 //
-// The Manager makes the pool spill the buffers of every run, to files at
-// runs/<run_id>/<side>/<bucket>/<seq>.rec in the data directory, with
-// "empty" for the bucket of the empty-key partition. A Join writes the
-// sub-partitions of oversized buckets under runs/<run_id>/join-<n>/ and
-// removes them before it ends.
+// Each run is one Spillable of the pool: a spill writes everything the run
+// holds in memory as one sorted run file, at runs/<run_id>/<seq>.run in the
+// data directory, through the Manager's one aligned write buffer. Seal
+// writes what a run that spilled still holds in memory as its last file,
+// and merges files if there are too many for a Join to read at once; a
+// run that never spilled stays in memory. A Join never writes, unless the
+// pool needs the memory of a run it is about to read and spills it.
 package run
 
 import (
@@ -22,9 +24,9 @@ import (
 	"path/filepath"
 	"runtime/metrics"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/z5labs/humus"
@@ -33,6 +35,8 @@ import (
 	"poc/internal/buffer"
 	"poc/internal/join"
 	"poc/internal/mem"
+	"poc/internal/merge"
+	"poc/internal/record"
 	"poc/internal/spill"
 )
 
@@ -69,7 +73,7 @@ type Config struct {
 	MaxBuckets       uint32
 	OutputBatchBytes int64
 	JoinParallelism  int
-	MaxMatchBytes    int64        // 0 means no limit
+	MaxMatchBytes    int64        // 0 means a worker's share of the budget
 	Logger           *slog.Logger // nil discards
 }
 
@@ -81,41 +85,52 @@ type Manager struct {
 	cfg  Config
 	log  *slog.Logger
 
+	// wbuf is the write buffer of every spill, reserved for the Manager's
+	// life. The pool spills one run at a time, and Seal spills through it
+	// too, so wmu is rarely waited for. Nothing reserves while holding it.
+	wmu      sync.Mutex
+	wbuf     []byte
+	reserved int64
+
 	mu   sync.Mutex
 	runs map[string]*Run
 }
 
 // NewManager returns a Manager whose runs reserve memory from pool and
 // keep their files in cfg.DataDir/runs on fsys, spilled through disk. It
-// makes pool spill the runs' buffers.
-func NewManager(fsys humus.FS, pool *mem.Pool, disk *spill.Disk, cfg Config) *Manager {
+// makes pool spill the runs' buffers. It fails if pool can't hold the
+// write buffer.
+func NewManager(fsys humus.FS, pool *mem.Pool, disk *spill.Disk, cfg Config) (*Manager, error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	m := &Manager{fsys: fsys, pool: pool, disk: disk, cfg: cfg, log: log, runs: map[string]*Run{}}
+	size := buffer.BlockSize(pool.Limit()) &^ (spill.Align - 1)
+	reserved := int64(size) + spill.Align
+	if err := pool.Reserve(reserved); err != nil {
+		return nil, fmt.Errorf("reserve the spill write buffer: %w", err)
+	}
+	m := &Manager{fsys: fsys, pool: pool, disk: disk, cfg: cfg, log: log, wbuf: spill.AlignedBuffer(size), reserved: reserved, runs: map[string]*Run{}}
 	pool.SetSource(m.spillable)
-	return m
+	return m, nil
 }
 
-// spillable returns every buffer of every run not being deleted.
+// spillable returns every run not being deleted.
 func (m *Manager) spillable() []mem.Spillable {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []mem.Spillable
 	for _, r := range m.runs {
-		if r.isDeleted() {
-			continue
-		}
-		for i := range r.targets {
-			out = append(out, &r.targets[i])
+		if !r.isDeleted() {
+			out = append(out, r)
 		}
 	}
 	return out
 }
 
-// Create creates an OPEN run with buckets buckets per side and returns its
-// ID.
+// Create creates an OPEN run and returns its ID. buckets is the run's
+// bucket_count, which is checked against the maximum and then ignored:
+// records are sorted, not partitioned.
 func (m *Manager) Create(buckets uint32) (string, error) {
 	if buckets < 1 || buckets > m.cfg.MaxBuckets {
 		return "", errorf(reconv1.ErrorReason_ERROR_REASON_INVALID_REQUEST, "bucket_count %d is outside 1 to %d", buckets, m.cfg.MaxBuckets)
@@ -129,15 +144,8 @@ func (m *Manager) Create(buckets uint32) (string, error) {
 		m:       m,
 		id:      id,
 		dir:     filepath.Join(m.cfg.DataDir, "runs", id),
-		parts:   buffer.NewPartitions(buckets),
+		buf:     buffer.New(m.pool),
 		cancels: map[int]context.CancelCauseFunc{},
-	}
-	for s := range 2 {
-		side := buffer.Side(s)
-		for i := range buckets {
-			r.targets = append(r.targets, target{r, side, strconv.FormatUint(uint64(i), 10), r.parts.Bucket(side, i)})
-		}
-		r.targets = append(r.targets, target{r, side, "empty", r.parts.Empty(side)})
 	}
 
 	m.mu.Lock()
@@ -204,6 +212,9 @@ func (m *Manager) Close(context.Context) error {
 	return errors.Join(errs...)
 }
 
+// Pool returns the Manager's memory pool.
+func (m *Manager) Pool() *mem.Pool { return m.pool }
+
 // State is a run's state.
 type State int
 
@@ -218,29 +229,34 @@ type sideTotals struct {
 	records, empty uint64
 }
 
-// Run is one run. It is safe for concurrent use.
+// Run is one run. It is safe for concurrent use. It is the Spillable the
+// pool spills its records through.
 type Run struct {
-	m       *Manager
-	id      string
-	dir     string
-	parts   *buffer.Partitions
-	targets []target // one per buffer
+	m   *Manager
+	id  string
+	dir string
+	buf *buffer.Buffer
 
-	// files is held for reading while a buffer is spilled, and for writing
-	// while delete removes the run's directory, so that no spill creates
-	// files in it again.
+	// files is held for reading while a file of the run is written, and for
+	// writing while delete removes the run's directory, so that nothing
+	// creates files in it again.
 	files     sync.RWMutex
-	diskBytes atomic.Int64 // of the run's spill files
+	diskBytes atomic.Int64 // of the run's files
+	seq       atomic.Int64 // of the next file
+	spills    atomic.Int64
 
 	deleteOnce sync.Once
 	deleteErr  error
+
+	sealMu sync.Mutex // held while Seal writes
 
 	mu         sync.Mutex
 	state      State
 	deleted    bool
 	cancels    map[int]context.CancelCauseFunc // of the contexts from WithContext
 	nextCancel int
-	streams    int // open ingest streams
+	streams    int  // open ingest streams
+	sealing    bool // Seal is writing
 	committed  uint32
 	totals     [2]sideTotals
 	sealed     *reconv1.SealRunResponse
@@ -275,10 +291,12 @@ func (r *Run) stateErr(want State) error {
 	switch {
 	case r.deleted:
 		return errNotFound()
-	case r.state == want:
+	case r.state == want && !(want == Open && r.sealing):
 		return nil
 	case r.state == Failed:
 		return errorf(reconv1.ErrorReason_ERROR_REASON_RUN_FAILED, "the run failed; delete it and rerun")
+	case r.state == Open && r.sealing && want == Open:
+		return errorf(reconv1.ErrorReason_ERROR_REASON_RUN_WRONG_STATE, "the run is being sealed")
 	case r.state == Open:
 		return errorf(reconv1.ErrorReason_ERROR_REASON_RUN_WRONG_STATE, "the run is not sealed")
 	default:
@@ -303,11 +321,11 @@ func (r *Run) remove() error {
 
 	r.files.Lock()
 	defer r.files.Unlock()
-	// A Join still reads the buffers until it sees the abort, so it frees
-	// them when it ends. Otherwise the pool would credit memory the Join
-	// still holds.
+	// A Join still reads the buffer until it sees the abort, so it frees it
+	// when it ends. Otherwise the pool would credit memory the Join still
+	// holds.
 	if !joining {
-		r.parts.Free(r.m.pool)
+		r.buf.Free()
 	}
 	if err := r.m.fsys.RemoveAll(r.dir); err != nil {
 		return fmt.Errorf("remove run directory: %w", err)
@@ -322,60 +340,87 @@ func (r *Run) isDeleted() bool {
 	return r.deleted
 }
 
-// target is a buffer of a run, as the pool spills it.
-type target struct {
-	r      *Run
-	side   buffer.Side
-	bucket string
-	b      *buffer.Buffer
-}
+// SpillSize returns the memory spilling the run would release now.
+func (r *Run) SpillSize() int64 { return r.buf.SpillSize() }
 
-func (t *target) SpillSize() int64 { return t.b.SpillSize() }
-
-func (t *target) Spill() error {
-	r := t.r
+// Spill writes the run's blocks as one new run file, unless the run was
+// deleted.
+func (r *Run) Spill() error {
 	r.files.RLock()
 	defer r.files.RUnlock()
 	if r.isDeleted() {
 		return nil
 	}
-	return t.b.Spill(r.m.pool, func(seq int, records int64, chunks [][]byte) (spill.File, error) {
-		path := filepath.Join(r.dir, t.side.String(), t.bucket, strconv.Itoa(seq)+".rec")
-		f, err := r.m.disk.Write(path, records, chunks)
-		if err == nil {
-			r.diskBytes.Add(f.Bytes)
+	return r.buf.Spill(r.write)
+}
+
+// path returns the path of the run's next file.
+func (r *Run) path() string {
+	return filepath.Join(r.dir, fmt.Sprintf("%06d.run", r.seq.Add(1)-1))
+}
+
+// write writes a spill of bytes bytes, the records of m, through the
+// Manager's write buffer. r.files is held for reading.
+func (r *Run) write(bytes int64, m *merge.Merger) (*spill.File, error) {
+	disk := r.m.disk
+	if err := disk.Reserve(bytes); err != nil {
+		return nil, err
+	}
+	r.m.wmu.Lock()
+	defer r.m.wmu.Unlock()
+	w, err := spill.Create(r.m.fsys, r.path(), r.m.wbuf)
+	if err != nil {
+		disk.Release(bytes)
+		return nil, err
+	}
+	if err := spill.Copy(context.Background(), w, m); err != nil {
+		w.Abort()
+		disk.Release(bytes)
+		return nil, err
+	}
+	f, err := w.Finish()
+	if err != nil {
+		disk.Release(bytes)
+		return nil, err
+	}
+	r.diskBytes.Add(bytes)
+	r.spills.Add(1)
+	return f, nil
+}
+
+// runFiles is where Compact writes the run's merged files. r.files is held
+// for reading while it is used.
+type runFiles struct{ r *Run }
+
+func (f runFiles) Create(bytes int64, buf []byte) (*spill.Writer, error) {
+	r := f.r
+	if err := r.m.disk.Reserve(bytes); err != nil {
+		return nil, err
+	}
+	w, err := spill.Create(r.m.fsys, r.path(), buf)
+	if err != nil {
+		r.m.disk.Release(bytes)
+		return nil, err
+	}
+	r.diskBytes.Add(bytes)
+	return w, nil
+}
+
+func (f runFiles) Unreserve(bytes int64) {
+	f.r.diskBytes.Add(-bytes)
+	f.r.m.disk.Release(bytes)
+}
+
+// Remove removes files. If that fails, the run's deletion gives back their
+// bytes once it removes them.
+func (f runFiles) Remove(files []*spill.File) {
+	r := f.r
+	for _, file := range files {
+		if err := r.m.fsys.Remove(file.Path); err == nil {
+			r.diskBytes.Add(-file.Bytes)
+			r.m.disk.Release(file.Bytes)
 		}
-		return f, err
-	})
-}
-
-// scratch is where the run's Joins write sub-partitions.
-type scratch struct{ r *Run }
-
-// Write writes a file under the run's directory, unless the run was
-// deleted: like a spill, it must not create the directory again.
-func (s scratch) Write(path string, records int64, chunks [][]byte) (spill.File, error) {
-	r := s.r
-	r.files.RLock()
-	defer r.files.RUnlock()
-	if r.isDeleted() {
-		return spill.File{}, ErrAborted
 	}
-	return r.m.disk.Write(filepath.Join(r.dir, path), records, chunks)
-}
-
-// Remove removes a directory under the run's directory. If it fails, the
-// run's deletion gives back the bytes once it removes the files.
-func (s scratch) Remove(dir string, bytes int64) error {
-	r := s.r
-	r.files.RLock()
-	defer r.files.RUnlock()
-	if err := r.m.fsys.RemoveAll(filepath.Join(r.dir, dir)); err != nil {
-		r.diskBytes.Add(bytes)
-		return err
-	}
-	r.m.disk.Release(bytes)
-	return nil
 }
 
 // Ingest is one open ingest stream of a run.
@@ -401,7 +446,7 @@ func (r *Run) BeginIngest() (*Ingest, error) {
 
 // Append appends one message's records to side. size is the decoded
 // message's size, which is reserved while its records are copied.
-func (in *Ingest) Append(side buffer.Side, records []*reconv1.Record, size int64) error {
+func (in *Ingest) Append(side record.Side, records []*reconv1.Record, size int64) error {
 	r := in.r
 	r.mu.Lock()
 	err := r.stateErr(Open)
@@ -420,19 +465,24 @@ func (in *Ingest) Append(side buffer.Side, records []*reconv1.Record, size int64
 		return err
 	}
 	defer pool.Release(size)
-	for _, rec := range records {
-		if err := r.parts.Append(pool, side, rec.GetKey(), rec.GetValue()); err != nil {
-			if errors.Is(err, buffer.ErrFreed) {
-				return ErrAborted
-			}
-			in.failOnDisk(err)
-			return err
-		}
-		in.accepted = true
+	n, err := r.buf.Append(side, len(records), func(i int) ([]byte, []byte) {
+		return records[i].GetKey(), records[i].GetValue()
+	})
+	for _, rec := range records[:n] {
 		in.totals[side].records++
 		if len(rec.GetKey()) == 0 {
 			in.totals[side].empty++
 		}
+	}
+	in.accepted = in.accepted || n > 0
+	switch {
+	case errors.Is(err, buffer.ErrFreed):
+		return ErrAborted
+	case errors.Is(err, buffer.ErrSealed):
+		return errorf(reconv1.ErrorReason_ERROR_REASON_RUN_WRONG_STATE, "the run is sealed")
+	case err != nil:
+		in.failOnDisk(err)
+		return err
 	}
 	return nil
 }
@@ -484,25 +534,94 @@ func (in *Ingest) Abandon() {
 
 // Seal seals an OPEN run and returns its totals. Sealing a SEALED run
 // returns the same totals.
+//
+// A run that spilled writes the records it still holds in memory as its
+// last file, and merges files if a Join couldn't read them all at once.
+// If that fails, the run stays OPEN, with every record it had, and Seal
+// may be called again.
 func (r *Run) Seal() (*reconv1.SealRunResponse, error) {
+	r.sealMu.Lock()
+	defer r.sealMu.Unlock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.state == Sealed && !r.deleted {
+		defer r.mu.Unlock()
 		return r.sealed, nil
 	}
 	if err := r.stateErr(Open); err != nil {
+		r.mu.Unlock()
 		return nil, err
 	}
 	if r.streams > 0 {
+		defer r.mu.Unlock()
 		return nil, errorf(reconv1.ErrorReason_ERROR_REASON_INGEST_IN_PROGRESS, "%d ingest streams are open", r.streams)
 	}
+	r.sealing = true
+	r.mu.Unlock()
+
+	start := time.Now()
+	merged, err := r.seal()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sealing = false
+	if r.deleted {
+		return nil, errNotFound()
+	}
+	if err != nil {
+		r.buf.Unseal()
+		return nil, err
+	}
+	files := r.buf.Files()
+	r.m.log.Info("run sealed",
+		"recon.run_id", r.id,
+		"recon.run_files", len(files),
+		"recon.spills", r.spills.Load(),
+		"recon.merges", merged.Merges,
+		"recon.merge_bytes", merged.Bytes,
+		"recon.merges_skipped", merged.Skipped,
+		"recon.seal_seconds", time.Since(start).Seconds(),
+	)
 	r.state = Sealed
 	r.sealed = &reconv1.SealRunResponse{
-		Left:             &reconv1.SideTotals{Records: r.totals[buffer.Left].records, EmptyKeyRecords: r.totals[buffer.Left].empty},
-		Right:            &reconv1.SideTotals{Records: r.totals[buffer.Right].records, EmptyKeyRecords: r.totals[buffer.Right].empty},
+		Left:             &reconv1.SideTotals{Records: r.totals[record.Left].records, EmptyKeyRecords: r.totals[record.Left].empty},
+		Right:            &reconv1.SideTotals{Records: r.totals[record.Right].records, EmptyKeyRecords: r.totals[record.Right].empty},
 		CommittedIngests: r.committed,
 	}
 	return r.sealed, nil
+}
+
+// seal does Seal's I/O: if the run spilled, it spills the rest and merges
+// files. Deleting the run cancels it.
+func (r *Run) seal() (join.MergeStats, error) {
+	spilled, err := r.buf.Seal()
+	if err != nil {
+		return join.MergeStats{}, err
+	}
+	if !spilled {
+		return join.MergeStats{}, nil
+	}
+	if err := r.Spill(); err != nil {
+		return join.MergeStats{}, err
+	}
+	ctx, cancel := r.WithContext(context.Background())
+	defer cancel()
+	r.files.RLock()
+	defer r.files.RUnlock()
+	if r.isDeleted() {
+		return join.MergeStats{}, ErrAborted
+	}
+	return join.Compact(ctx, r.m.pool, r.m.fsys, r.buf, runFiles{r}, r.joinOptions(join.Filter{}, [2]uint64{}))
+}
+
+// joinOptions returns the options of a Join of the run, or of a merge.
+func (r *Run) joinOptions(filter join.Filter, totals [2]uint64) join.Options {
+	return join.Options{
+		Filter:           filter,
+		OutputBatchBytes: r.m.cfg.OutputBatchBytes,
+		Totals:           totals,
+		Parallelism:      r.m.cfg.JoinParallelism,
+		MaxMatchBytes:    r.m.cfg.MaxMatchBytes,
+	}
 }
 
 // Join streams the full outer join of a SEALED run to send. Only one Join
@@ -518,7 +637,7 @@ func (r *Run) Join(ctx context.Context, filter join.Filter, send func(*reconv1.J
 		return errorf(reconv1.ErrorReason_ERROR_REASON_JOIN_IN_PROGRESS, "another Join of the run is in progress")
 	}
 	r.joining = true
-	totals := [2]uint64{r.totals[buffer.Left].records, r.totals[buffer.Right].records}
+	totals := [2]uint64{r.totals[record.Left].records, r.totals[record.Right].records}
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
@@ -526,37 +645,32 @@ func (r *Run) Join(ctx context.Context, filter join.Filter, send func(*reconv1.J
 		deleted := r.deleted
 		r.mu.Unlock()
 		if deleted {
-			r.parts.Free(r.m.pool)
+			r.buf.Free()
 		}
 	}()
 
 	ctx, cancel := r.WithContext(ctx)
 	defer cancel()
-	stats, err := join.Run(ctx, r.m.pool, r.m.disk, r.parts, join.Options{
-		Filter:           filter,
-		OutputBatchBytes: r.m.cfg.OutputBatchBytes,
-		Totals:           totals,
-		Parallelism:      r.m.cfg.JoinParallelism,
-		MaxMatchBytes:    r.m.cfg.MaxMatchBytes,
-		Scratch:          scratch{r},
-		Log:              r.m.log.With("recon.run_id", r.id),
-	}, send)
+	start := time.Now()
+	stats, err := join.Run(ctx, r.m.pool, r.m.fsys, r.buf, r.joinOptions(filter, totals), send)
 	if err != nil {
 		return err
 	}
-	var factor float64
-	if stats.RecordBytes > 0 {
-		factor = float64(stats.WorkingSet) / float64(stats.RecordBytes)
-	}
 	r.m.log.InfoContext(ctx, "join finished",
 		"recon.run_id", r.id,
-		"recon.join_units", stats.Units,
+		"recon.join_files", stats.Files,
+		"recon.join_blocks", stats.Blocks,
+		"recon.join_workers", stats.Workers,
+		"recon.join_tasks", stats.Tasks,
+		"recon.join_read_buffer_bytes", stats.ReadBuffer,
+		"recon.join_reads", stats.Reads,
+		"recon.join_batches", stats.Batches,
+		"recon.join_streamed_keys", stats.Streamed,
+		"recon.join_seconds", time.Since(start).Seconds(),
+		"recon.max_match_bytes", stats.MaxMatch,
 		"recon.pool_peak_bytes", r.m.pool.Peak(),
 		"recon.go_peak_bytes", goPeak(),
 		"recon.disk_peak_bytes", r.m.disk.Peak(),
-		"recon.expansion_factor", factor,
-		"recon.largest_unit_record_bytes", stats.Largest.RecordBytes,
-		"recon.largest_unit_working_set_bytes", stats.Largest.WorkingSet,
 	)
 	return nil
 }

@@ -13,12 +13,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/z5labs/humus/humustest"
+	"google.golang.org/protobuf/proto"
 
 	reconv1 "poc/gen/recon/v1"
-	"poc/internal/buffer"
 	"poc/internal/join"
 	"poc/internal/mem"
 	"poc/internal/oracle"
+	"poc/internal/record"
 	"poc/internal/spill"
 )
 
@@ -39,13 +40,23 @@ func newEnvWithDisk(t *testing.T, limit, diskLimit int64) *env {
 	h := humustest.NewHost(t, humustest.WithFiles(map[string][]byte{"data/.keep": nil}))
 	pool := mem.NewPool(limit)
 	disk := spill.NewDisk(h.FS(), diskLimit)
-	return &env{host: h, pool: pool, disk: disk, m: NewManager(h.FS(), pool, disk, Config{
+	m, err := NewManager(h.FS(), pool, disk, Config{
 		DataDir:          h.Path("data"),
 		MaxRuns:          3,
 		MaxBuckets:       64,
 		OutputBatchBytes: 4096,
 		JoinParallelism:  2,
-	})}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &env{host: h, pool: pool, disk: disk, m: m}
+}
+
+// inUse returns the bytes reserved from the pool for runs: all of it but
+// the Manager's write buffer and the idle blocks.
+func (e *env) inUse() int64 {
+	return e.pool.Used() - e.pool.Idle() - e.m.reserved
 }
 
 func (e *env) create(t *testing.T, buckets uint32) (string, *Run) {
@@ -61,7 +72,7 @@ func (e *env) create(t *testing.T, buckets uint32) (string, *Run) {
 	return id, r
 }
 
-func records(side buffer.Side, keys ...string) []*reconv1.Record {
+func records(side record.Side, keys ...string) []*reconv1.Record {
 	var out []*reconv1.Record
 	for i, k := range keys {
 		out = append(out, &reconv1.Record{Key: []byte(k), Value: fmt.Appendf(nil, "%v-%d", side, i)})
@@ -78,7 +89,7 @@ func ingest(t *testing.T, r *Run, batches ...[]*reconv1.Record) {
 	}
 	defer in.Abandon()
 	for i, b := range batches {
-		if err := in.Append(buffer.Side(i%2), b, 100); err != nil {
+		if err := in.Append(record.Side(i%2), b, 100); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -101,10 +112,12 @@ func wantReason(t *testing.T, what string, err error, want reconv1.ErrorReason) 
 	}
 }
 
+// joinAll joins r and returns its results, cloned: a batch is valid only
+// until send returns.
 func joinAll(r *Run) ([]*reconv1.JoinResult, error) {
 	var out []*reconv1.JoinResult
 	err := r.Join(context.Background(), join.NewFilter(nil), func(resp *reconv1.JoinResponse) error {
-		out = append(out, resp.GetResults()...)
+		out = append(out, proto.Clone(resp).(*reconv1.JoinResponse).GetResults()...)
 		return nil
 	})
 	return out, err
@@ -169,8 +182,8 @@ func TestRun_lifecycle(t *testing.T) {
 	_, err := joinAll(r)
 	wantReason(t, "Join before Seal", err, reconv1.ErrorReason_ERROR_REASON_RUN_WRONG_STATE)
 
-	ingest(t, r, records(buffer.Left, "a", "b", "", "a"), records(buffer.Right, "a", "c", ""))
-	ingest(t, r, records(buffer.Left, "d"))
+	ingest(t, r, records(record.Left, "a", "b", "", "a"), records(record.Right, "a", "c", ""))
+	ingest(t, r, records(record.Left, "d"))
 	sealed, err := r.Seal()
 	if err != nil {
 		t.Fatal(err)
@@ -196,8 +209,8 @@ func TestRun_lifecycle(t *testing.T) {
 	if err := e.m.Delete(id); err != nil {
 		t.Fatal(err)
 	}
-	if e.pool.Used() != 0 {
-		t.Errorf("pool has %d reserved after Delete", e.pool.Used())
+	if e.inUse() != 0 {
+		t.Errorf("pool has %d reserved after Delete", e.inUse())
 	}
 	if _, err := os.Stat(e.host.Path("data/runs/" + id)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("run directory after Delete: %v", err)
@@ -250,11 +263,11 @@ func TestRun_a_failed_stream_fails_the_run_only_once_records_were_accepted(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := in.Append(buffer.Left, records(buffer.Left, "a"), 10); err != nil {
+	if err := in.Append(record.Left, records(record.Left, "a"), 10); err != nil {
 		t.Fatal(err)
 	}
 	in.Abandon()
-	err = other.Append(buffer.Right, records(buffer.Right, "a"), 10)
+	err = other.Append(record.Right, records(record.Right, "a"), 10)
 	wantReason(t, "Append to a failed run", err, reconv1.ErrorReason_ERROR_REASON_RUN_FAILED)
 	err = other.Commit()
 	wantReason(t, "Commit to a failed run", err, reconv1.ErrorReason_ERROR_REASON_RUN_FAILED)
@@ -274,7 +287,7 @@ func TestRun_memory_exhausted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := in.Append(buffer.Left, records(buffer.Left, "a"), 128<<10); !errors.Is(err, mem.ErrExhausted) {
+	if err := in.Append(record.Left, records(record.Left, "a"), 128<<10); !errors.Is(err, mem.ErrExhausted) {
 		t.Fatalf("Append of a message larger than the budget: %v, want ErrExhausted", err)
 	}
 	in.Abandon()
@@ -291,7 +304,7 @@ func TestRun_memory_exhausted(t *testing.T) {
 	}
 	defer in.Abandon()
 	big := []*reconv1.Record{{Key: []byte("a")}, {Key: []byte("b"), Value: make([]byte, 8<<10)}}
-	if err := in.Append(buffer.Left, big, 58<<10); !errors.Is(err, mem.ErrExhausted) {
+	if err := in.Append(record.Left, big, e.pool.Limit()-e.m.reserved-6<<10); !errors.Is(err, mem.ErrExhausted) {
 		t.Fatalf("Append past the budget: %v, want ErrExhausted", err)
 	}
 	if e.pool.Used() > e.pool.Limit() {
@@ -305,16 +318,17 @@ func TestRun_memory_exhausted(t *testing.T) {
 func TestRun_one_Join_at_a_time(t *testing.T) {
 	e := newEnv(t, 1<<30)
 	_, r := e.create(t, 4)
-	ingest(t, r, records(buffer.Left, "a", "b"), records(buffer.Right, "b", "c"))
+	ingest(t, r, records(record.Left, "a", "b"), records(record.Right, "b", "c"))
 	if _, err := r.Seal(); err != nil {
 		t.Fatal(err)
 	}
 	inside := make(chan struct{})
 	release := make(chan struct{})
 	done := make(chan error)
+	var once sync.Once
 	go func() {
 		done <- r.Join(context.Background(), join.NewFilter(nil), func(*reconv1.JoinResponse) error {
-			close(inside)
+			once.Do(func() { close(inside) })
 			<-release
 			return nil
 		})
@@ -362,8 +376,8 @@ func TestDelete_aborts_a_Join(t *testing.T) {
 	if sent != 1 {
 		t.Errorf("sent %d batches, want the Join to stop after the first", sent)
 	}
-	if e.pool.Used() != 0 {
-		t.Errorf("pool has %d reserved after Delete", e.pool.Used())
+	if e.inUse() != 0 {
+		t.Errorf("pool has %d reserved after Delete", e.inUse())
 	}
 }
 
@@ -383,15 +397,15 @@ func TestDelete_aborts_ingest(t *testing.T) {
 	if !errors.Is(context.Cause(ctx), ErrAborted) {
 		t.Errorf("cause = %v, want ErrAborted", context.Cause(ctx))
 	}
-	if err := in.Append(buffer.Left, records(buffer.Left, "a"), 10); !errors.Is(err, ErrAborted) {
+	if err := in.Append(record.Left, records(record.Left, "a"), 10); !errors.Is(err, ErrAborted) {
 		t.Errorf("Append after Delete: %v, want ErrAborted", err)
 	}
 	if err := in.Commit(); !errors.Is(err, ErrAborted) {
 		t.Errorf("Commit after Delete: %v, want ErrAborted", err)
 	}
 	in.Abandon()
-	if e.pool.Used() != 0 {
-		t.Errorf("pool has %d reserved", e.pool.Used())
+	if e.inUse() != 0 {
+		t.Errorf("pool has %d reserved", e.inUse())
 	}
 }
 
@@ -412,7 +426,7 @@ func TestRun_concurrent_streams_match_the_oracle(t *testing.T) {
 			}
 			defer in.Abandon()
 			for b := range 20 {
-				side := buffer.Side((s + b) % 2)
+				side := record.Side((s + b) % 2)
 				var batch []*reconv1.Record
 				for i := range 50 {
 					key := fmt.Appendf(nil, "k%d", (s*7+b*3+i)%300)
@@ -456,7 +470,7 @@ func TestRun_concurrent_streams_match_the_oracle(t *testing.T) {
 func TestManager_Close_deletes_every_run(t *testing.T) {
 	e := newEnv(t, 1<<30)
 	_, r := e.create(t, 2)
-	ingest(t, r, records(buffer.Left, "a"))
+	ingest(t, r, records(record.Left, "a"))
 	e.create(t, 2)
 	if err := e.m.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -465,15 +479,15 @@ func TestManager_Close_deletes_every_run(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 || e.pool.Used() != 0 {
-		t.Errorf("after Close: %d run directories, %d bytes reserved", len(entries), e.pool.Used())
+	if len(entries) != 0 || e.inUse() != 0 {
+		t.Errorf("after Close: %d run directories, %d bytes reserved", len(entries), e.inUse())
 	}
 }
 
 func TestManager_Delete_waits_for_a_Delete_in_progress(t *testing.T) {
 	e := newEnv(t, 1<<30)
 	id, r := e.create(t, 2)
-	ingest(t, r, records(buffer.Left, "a"))
+	ingest(t, r, records(record.Left, "a"))
 
 	// Holding the run's files for reading, as a spill does, stops the first
 	// Delete before it removes them.

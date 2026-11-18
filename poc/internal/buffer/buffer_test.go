@@ -7,414 +7,444 @@ import (
 	"slices"
 	"sync"
 	"testing"
-	"testing/synctest"
+
+	"pgregory.net/rapid"
 
 	"poc/internal/mem"
+	"poc/internal/merge"
+	"poc/internal/record"
 	"poc/internal/spill"
 )
 
-func TestEncoding_round_trips(t *testing.T) {
-	cases := []struct{ key, value []byte }{
-		{nil, nil},
-		{[]byte("k"), nil},
-		{nil, []byte("v")},
-		{[]byte("key"), []byte("value")},
-		{bytes.Repeat([]byte{0}, 200), bytes.Repeat([]byte{0xff}, 70000)},
+type rec struct {
+	side       record.Side
+	key, value []byte
+}
+
+func appendAll(t testing.TB, b *Buffer, side record.Side, recs ...rec) error {
+	t.Helper()
+	n, err := b.Append(side, len(recs), func(i int) ([]byte, []byte) { return recs[i].key, recs[i].value })
+	if err == nil && n != len(recs) {
+		t.Fatalf("Append copied %d of %d records without an error", n, len(recs))
 	}
-	var b []byte
-	for i, c := range cases {
-		b = AppendRecord(b, uint64(i)*0x0101010101010101, c.key, c.value)
+	return err
+}
+
+// memFile is a run file kept in memory.
+type memFile struct {
+	recs [][]byte
+}
+
+// spiller writes spills to memory, and fails while err is set.
+type spiller struct {
+	mu    sync.Mutex
+	files map[*spill.File]*memFile
+	err   error
+}
+
+func (s *spiller) write(size int64, m *merge.Merger) (*spill.File, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return nil, s.err
 	}
-	off := 0
-	for i, c := range cases {
-		start := off
-		hash, key, value, next := Decode(b, off)
-		if hash != uint64(i)*0x0101010101010101 || !bytes.Equal(key, c.key) || !bytes.Equal(value, c.value) {
-			t.Errorf("record %d decoded as (%x, %q, %d bytes)", i, hash, key, len(value))
+	f, mf := &spill.File{Bytes: size}, &memFile{}
+	var n int64
+	for src := m.Top(); src != nil; src = m.Top() {
+		mf.recs = append(mf.recs, bytes.Clone(src.Head()))
+		n += int64(len(src.Head()))
+		if err := m.Pop(); err != nil {
+			return nil, err
 		}
-		if next-start != EncodedLen(c.key, c.value) {
-			t.Errorf("record %d: %d bytes, EncodedLen says %d", i, next-start, EncodedLen(c.key, c.value))
-		}
-		if cap(key) != len(key) || cap(value) != len(value) {
-			t.Errorf("record %d: key or value isn't capped, so appending would overwrite the chunk", i)
-		}
-		off = next
 	}
-	if off != len(b) {
-		t.Errorf("decoded %d of %d bytes", off, len(b))
+	if n != size {
+		return nil, fmt.Errorf("the merge has %d bytes, the spill said %d", n, size)
+	}
+	f.Records = int64(len(mf.recs))
+	if s.files == nil {
+		s.files = map[*spill.File]*memFile{}
+	}
+	s.files[f] = mf
+	return f, nil
+}
+
+// contents returns what b holds, files first, then blocks, each in its
+// order, as (side, key, value) records.
+func (s *spiller) contents(b *Buffer) [][]rec {
+	snap := b.Pin()
+	defer b.Unpin()
+	var out [][]rec
+	for _, f := range snap.Files {
+		var rs []rec
+		for _, r := range s.files[f].recs {
+			_, side, k, v := record.Decode(r)
+			rs = append(rs, rec{side, k, v})
+		}
+		out = append(out, rs)
+	}
+	for i := range snap.Blocks() {
+		var rs []rec
+		src := snap.Source(i, 0, record.Fences, 0)
+		for _, ok := src.Peek(); ok; _, ok = src.Peek() {
+			_, side, k, v := record.Decode(src.Head())
+			rs = append(rs, rec{side, bytes.Clone(k), bytes.Clone(v)})
+			_ = src.Next()
+		}
+		out = append(out, rs)
+	}
+	return out
+}
+
+func sortedRecs(rs []rec) bool {
+	return slices.IsSortedFunc(rs, func(a, b rec) int {
+		return record.Compare(record.Append(nil, record.Hash(a.key), a.side, a.key, nil), record.Append(nil, record.Hash(b.key), b.side, b.key, nil))
+	})
+}
+
+func TestBlockSize(t *testing.T) {
+	for _, tt := range []struct{ limit, want int64 }{{1 << 30, 1 << 20}, {32 << 20, 1 << 20}, {1 << 20, 32 << 10}, {64 << 10, 4 << 10}, {1, 4 << 10}} {
+		if got := BlockSize(tt.limit); int64(got) != tt.want {
+			t.Errorf("BlockSize(%d) = %d, want %d", tt.limit, got, tt.want)
+		}
 	}
 }
 
-func records(b *Buffer) (keys, values []string) {
-	for _, c := range b.Chunks() {
-		for off := 0; off < len(c); {
-			var k, v []byte
-			_, k, v, off = Decode(c, off)
-			keys, values = append(keys, string(k)), append(values, string(v))
+func TestBuffer_spills_every_block_to_one_sorted_file(t *testing.T) {
+	pool := mem.NewPool(1 << 20)
+	b := New(pool)
+	var want []rec
+	for i := range 2000 {
+		r := rec{record.Side(i % 2), fmt.Appendf(nil, "key-%d", i%300), fmt.Appendf(nil, "value-%d", i)}
+		if i%97 == 0 {
+			r.key = nil
 		}
-	}
-	return keys, values
-}
-
-func TestBuffer_chunks_grow_and_are_reserved(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	var b Buffer
-	value := bytes.Repeat([]byte("x"), 1000)
-	for i := range 5000 {
-		if err := b.Append(pool, uint64(i), fmt.Appendf(nil, "k%d", i), value); err != nil {
+		if err := appendAll(t, b, r.side, r); err != nil {
 			t.Fatal(err)
 		}
+		want = append(want, r)
 	}
-	chunks := b.Chunks()
-	var reserved int64
-	for i, c := range chunks {
-		reserved += int64(cap(c))
-		want := min(minChunk<<i, maxChunk)
-		if cap(c) != want {
-			t.Errorf("chunk %d has capacity %d, want %d", i, cap(c), want)
+	inMemory := pool.Used()
+	if inMemory == 0 || b.SpillSize() != inMemory {
+		t.Fatalf("SpillSize %d, pool %d: want the blocks' reservation", b.SpillSize(), inMemory)
+	}
+	s := &spiller{}
+	if err := b.Spill(s.write); err != nil {
+		t.Fatal(err)
+	}
+	if b.SpillSize() != 0 || pool.Used()-pool.Idle() != spill.FileBytes {
+		t.Errorf("after the spill: SpillSize %d, %d in use; want only the file's %d", b.SpillSize(), pool.Used()-pool.Idle(), spill.FileBytes)
+	}
+	if _, err := b.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	got := s.contents(b)
+	if len(got) != 1 || len(got[0]) != len(want) || !sortedRecs(got[0]) {
+		t.Fatalf("%d files and blocks, want one sorted file of %d records", len(got), len(want))
+	}
+	// Records of one key and side keep their order.
+	groups := map[string][]string{}
+	for _, r := range want {
+		k := fmt.Sprint(r.side, string(r.key))
+		groups[k] = append(groups[k], string(r.value))
+	}
+	for _, r := range got[0] {
+		k := fmt.Sprint(r.side, string(r.key))
+		if groups[k][0] != string(r.value) {
+			t.Fatalf("key %q of %v: %q came before %q", r.key, r.side, r.value, groups[k][0])
 		}
+		groups[k] = groups[k][1:]
 	}
-	if got := pool.Used(); got != reserved {
-		t.Errorf("pool has %d reserved, chunks hold %d", got, reserved)
-	}
-	if b.Records() != 5000 {
-		t.Errorf("Records = %d, want 5000", b.Records())
-	}
-	keys, values := records(&b)
-	for i := range keys {
-		if keys[i] != fmt.Sprintf("k%d", i) || values[i] != string(value) {
-			t.Fatalf("record %d is %q, out of ingest order", i, keys[i])
-		}
-	}
-	b.Free(pool)
-	if pool.Used() != 0 {
-		t.Errorf("pool has %d reserved after Free", pool.Used())
-	}
-	if err := b.Append(pool, 0, []byte("k"), nil); !errors.Is(err, ErrFreed) {
-		t.Errorf("Append after Free: %v, want ErrFreed", err)
+	b.Free()
+	if pool.Used() != pool.Idle() {
+		t.Errorf("after Free: %d in use", pool.Used()-pool.Idle())
 	}
 }
 
-func TestBuffer_a_record_larger_than_a_chunk_gets_its_own(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	var b Buffer
-	big := bytes.Repeat([]byte("v"), 3*maxChunk)
-	if err := b.Append(pool, 1, []byte("k"), big); err != nil {
+func TestBuffer_a_failed_spill_keeps_the_records_in_memory(t *testing.T) {
+	pool := mem.NewPool(1 << 20)
+	b := New(pool)
+	if err := appendAll(t, b, record.Left, rec{key: []byte("a")}, rec{key: []byte("b")}); err != nil {
 		t.Fatal(err)
 	}
-	if c := b.Chunks(); len(c) != 1 || cap(c[0]) != EncodedLen([]byte("k"), big) {
-		t.Errorf("got %d chunks, want one of exactly the record's size", len(c))
+	failing := errors.New("disk on fire")
+	s := &spiller{err: failing}
+	if err := b.Spill(s.write); !errors.Is(err, failing) {
+		t.Fatalf("Spill: %v", err)
+	}
+	if err := appendAll(t, b, record.Right, rec{key: []byte("a")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	for _, blk := range s.contents(b) {
+		n += len(blk)
+	}
+	if n != 3 || len(b.Files()) != 0 {
+		t.Errorf("%d records, %d files after the failed spill; want 3 records in memory", n, len(b.Files()))
+	}
+}
+
+func TestBuffer_a_record_larger_than_a_block_gets_its_own(t *testing.T) {
+	pool := mem.NewPool(1 << 20)
+	b := New(pool)
+	big := rec{key: []byte("big"), value: make([]byte, 3*b.blockSize)}
+	if err := appendAll(t, b, record.Left, rec{key: []byte("a")}, big, rec{key: []byte("b")}); err != nil {
+		t.Fatal(err)
+	}
+	if pool.Used() < int64(3*b.blockSize) {
+		t.Errorf("pool has %d reserved for a record of %d", pool.Used(), 3*b.blockSize)
+	}
+	s := &spiller{}
+	if err := b.Spill(s.write); err != nil {
+		t.Fatal(err)
+	}
+	// Only blocks of the usual size go idle.
+	if pool.Idle() > int64(b.blockSize)+blockOverhead {
+		t.Errorf("%d bytes idle after spilling one usual block and one large one", pool.Idle())
 	}
 }
 
 func TestBuffer_fails_when_the_pool_is_exhausted(t *testing.T) {
-	pool := mem.NewPool(minChunk + minChunk/2)
-	var b Buffer
-	value := bytes.Repeat([]byte("v"), 1000)
-	var err error
-	n := 0
-	for ; err == nil; n++ {
-		err = b.Append(pool, 0, []byte("k"), value)
-	}
-	if !errors.Is(err, mem.ErrExhausted) {
-		t.Fatalf("Append: %v, want ErrExhausted", err)
-	}
-	if b.Records() != int64(n-1) || pool.Used() != minChunk {
-		t.Errorf("after the failure: %d records, %d reserved; want %d and %d", b.Records(), pool.Used(), n-1, minChunk)
+	pool := mem.NewPool(4 << 10)
+	b := New(pool)
+	n, err := b.Append(record.Left, 2, func(i int) ([]byte, []byte) { return []byte("k"), nil })
+	if !errors.Is(err, mem.ErrExhausted) || n != 0 {
+		t.Errorf("Append under a budget smaller than a block: %d, %v; want 0 and ErrExhausted", n, err)
 	}
 }
 
-func TestBuffer_concurrent_appends_keep_every_record(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	var b Buffer
-	var wg sync.WaitGroup
-	for g := range 8 {
-		wg.Go(func() {
-			for i := range 2000 {
-				if err := b.Append(pool, 0, fmt.Appendf(nil, "%d-%d", g, i), []byte("value")); err != nil {
-					t.Error(err)
-					return
-				}
-			}
-		})
-	}
-	wg.Wait()
-	keys, _ := records(&b)
-	seen := map[string]bool{}
-	for _, k := range keys {
-		seen[k] = true
-	}
-	if len(keys) != 16000 || len(seen) != 16000 {
-		t.Errorf("got %d records, %d distinct, want 16000", len(keys), len(seen))
-	}
-	var reserved int64
-	for _, c := range b.Chunks() {
-		reserved += int64(cap(c))
-	}
-	if pool.Used() != reserved {
-		t.Errorf("pool has %d reserved, chunks hold %d", pool.Used(), reserved)
-	}
-}
-
-func TestPartitions_route_by_hash_and_empty_keys_apart(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	p := NewPartitions(7)
-	for i := range 100 {
-		if err := p.Append(pool, Right, fmt.Appendf(nil, "key-%d", i), nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := p.Append(pool, Left, nil, []byte("no key")); err != nil {
+func TestBuffer_Append_after_Seal_or_Free_fails(t *testing.T) {
+	pool := mem.NewPool(1 << 20)
+	b := New(pool)
+	if _, err := b.Seal(); err != nil {
 		t.Fatal(err)
 	}
-	var total int64
-	for i := range p.Buckets() {
-		if p.Bucket(Left, i).Records() != 0 {
-			t.Errorf("left bucket %d holds records", i)
-		}
-		for _, c := range p.Bucket(Right, i).Chunks() {
-			for off := 0; off < len(c); {
-				hash, key, _, next := Decode(c, off)
-				if hash != Hash(key) || hash%7 != uint64(i) {
-					t.Errorf("key %q with hash %x is in bucket %d", key, hash, i)
-				}
-				total++
-				off = next
-			}
-		}
+	if err := appendAll(t, b, record.Left, rec{key: []byte("a")}); !errors.Is(err, ErrSealed) {
+		t.Errorf("Append after Seal: %v", err)
 	}
-	if total != 100 {
-		t.Errorf("buckets hold %d records, want 100", total)
+	b.Unseal()
+	if err := appendAll(t, b, record.Left, rec{key: []byte("a")}); err != nil {
+		t.Errorf("Append after Unseal: %v", err)
 	}
-	if p.Empty(Left).Records() != 1 || p.Empty(Right).Records() != 0 {
-		t.Errorf("empty-key partitions hold %d and %d, want 1 and 0", p.Empty(Left).Records(), p.Empty(Right).Records())
+	b.Free()
+	if err := appendAll(t, b, record.Left, rec{key: []byte("a")}); !errors.Is(err, ErrFreed) {
+		t.Errorf("Append after Free: %v", err)
 	}
-	p.Free(pool)
-	if pool.Used() != 0 {
-		t.Errorf("pool has %d reserved after Free", pool.Used())
-	}
-}
-
-// memWrite is a spill write that keeps files in memory.
-type memWrite struct {
-	files map[string][]byte
-	err   error
-}
-
-func (w *memWrite) write(seq int, records int64, chunks [][]byte) (spill.File, error) {
-	if w.err != nil {
-		return spill.File{}, w.err
-	}
-	name := fmt.Sprint(seq)
-	if _, ok := w.files[name]; ok {
-		return spill.File{}, fmt.Errorf("file %s exists", name)
-	}
-	data := slices.Concat(chunks...)
-	w.files[name] = data
-	return spill.File{Path: name, Records: records, Bytes: int64(len(data))}, nil
-}
-
-// pinned returns the keys of b's records, from its files and chunks, in
-// order.
-func (w *memWrite) pinned(b *Buffer) []string {
-	files, chunks := b.Pin()
-	defer b.Unpin()
-	var all [][]byte
-	for _, f := range files {
-		all = append(all, w.files[f.Path])
-	}
-	var keys []string
-	for _, c := range append(all, chunks...) {
-		for off := 0; off < len(c); {
-			var k []byte
-			_, k, _, off = Decode(c, off)
-			keys = append(keys, string(k))
-		}
-	}
-	return keys
-}
-
-func TestBuffer_Spill_moves_its_chunks_to_a_file(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	w := &memWrite{files: map[string][]byte{}}
-	var b Buffer
-	var want []string
-	add := func(n int) {
-		for range n {
-			k := fmt.Sprintf("k%d", len(want))
-			if err := b.Append(pool, 0, []byte(k), make([]byte, 100)); err != nil {
-				t.Fatal(err)
-			}
-			want = append(want, k)
-		}
-	}
-	add(300)
-	size := b.SpillSize()
-	if size == 0 || size != pool.Used() {
-		t.Fatalf("SpillSize = %d with %d reserved", size, pool.Used())
-	}
-	if err := b.Spill(pool, w.write); err != nil {
-		t.Fatal(err)
-	}
-	if pool.Used() != 0 || len(b.Chunks()) != 0 || b.SpillSize() != 0 {
-		t.Errorf("after Spill: %d reserved, %d chunks", pool.Used(), len(b.Chunks()))
-	}
-	if f := b.Files(); len(f) != 1 || f[0].Records != 300 || f[0].Bytes != b.Bytes() {
-		t.Errorf("Files = %+v, want one of 300 records and %d bytes", f, b.Bytes())
-	}
-	add(5)
-	if c := b.Chunks(); len(c) != 1 || cap(c[0]) != minChunk {
-		t.Errorf("after a spill the buffer has %d chunks, want one of %d bytes", len(c), minChunk)
-	}
-	if err := b.Spill(pool, w.write); err != nil {
-		t.Fatal(err)
-	}
-	add(7)
-	if b.Records() != 312 || len(b.Files()) != 2 {
-		t.Errorf("Records = %d, %d files; want 312 and 2", b.Records(), len(b.Files()))
-	}
-	if got := w.pinned(&b); !slices.Equal(got, want) {
-		t.Errorf("records out of ingest order across files and chunks")
-	}
-}
-
-func TestBuffer_a_failed_Spill_keeps_the_records_in_memory(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	w := &memWrite{files: map[string][]byte{}}
-	var b Buffer
-	for i := range 100 {
-		if err := b.Append(pool, 0, fmt.Appendf(nil, "k%d", i), make([]byte, 100)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	used := pool.Used()
-	w.err = errors.New("disk full")
-	if err := b.Spill(pool, w.write); !errors.Is(err, w.err) {
-		t.Fatalf("Spill: %v, want the write's error", err)
-	}
-	if pool.Used() != used || len(b.Files()) != 0 || b.SpillSize() != used {
-		t.Errorf("after the failed Spill: %d reserved, %d files", pool.Used(), len(b.Files()))
-	}
-	w.err = nil
-	if err := b.Spill(pool, w.write); err != nil {
-		t.Fatalf("Spill after the failure: %v", err)
-	}
-	if got := w.pinned(&b); len(got) != 100 || got[0] != "k0" || got[99] != "k99" {
-		t.Errorf("got %d records after the retried spill", len(got))
+	if _, err := b.Seal(); !errors.Is(err, ErrFreed) {
+		t.Errorf("Seal after Free: %v", err)
 	}
 }
 
 func TestBuffer_a_pinned_buffer_isnt_spilled(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	w := &memWrite{files: map[string][]byte{}}
-	var b Buffer
-	if err := b.Append(pool, 0, []byte("k"), nil); err != nil {
+	pool := mem.NewPool(1 << 20)
+	b := New(pool)
+	if err := appendAll(t, b, record.Left, rec{key: []byte("a")}); err != nil {
 		t.Fatal(err)
 	}
-	b.Pin()
-	if b.SpillSize() != 0 {
-		t.Errorf("SpillSize of a pinned buffer = %d, want 0", b.SpillSize())
+	if _, err := b.Seal(); err != nil {
+		t.Fatal(err)
 	}
-	if err := b.Spill(pool, w.write); err != nil || len(w.files) != 0 {
-		t.Errorf("Spill of a pinned buffer: %v, %d files", err, len(w.files))
+	snap := b.Pin()
+	if b.SpillSize() != 0 {
+		t.Error("a pinned buffer has a SpillSize")
+	}
+	s := &spiller{}
+	if err := b.Spill(s.write); err != nil || len(s.files) != 0 {
+		t.Errorf("Spill of a pinned buffer: %v, %d files", err, len(s.files))
+	}
+	if snap.Blocks() != 1 {
+		t.Errorf("%d blocks pinned, want 1", snap.Blocks())
 	}
 	b.Unpin()
-	if err := b.Spill(pool, w.write); err != nil || len(w.files) != 1 {
-		t.Errorf("Spill once unpinned: %v, %d files", err, len(w.files))
+	if err := b.Spill(s.write); err != nil || len(s.files) != 1 {
+		t.Errorf("Spill after Unpin: %v, %d files", err, len(s.files))
 	}
 }
 
-func TestBuffer_Pin_and_Free_wait_for_a_spill_in_progress(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		pool := mem.NewPool(1 << 30)
-		w := &memWrite{files: map[string][]byte{}}
-		var b Buffer
-		if err := b.Append(pool, 0, []byte("a"), nil); err != nil {
+func TestBuffer_reuses_idle_blocks(t *testing.T) {
+	pool := mem.NewPool(1 << 20)
+	a, b := New(pool), New(pool)
+	block := int64(a.blockSize) + blockOverhead
+	for i := 0; a.SpillSize() < 3*block; i++ {
+		if err := appendAll(t, a, record.Left, rec{key: fmt.Appendf(nil, "%d", i), value: make([]byte, 100)}); err != nil {
 			t.Fatal(err)
 		}
-		writing, release := make(chan struct{}), make(chan struct{})
-		go func() {
-			err := b.Spill(pool, func(seq int, records int64, chunks [][]byte) (spill.File, error) {
-				close(writing)
-				<-release
-				return w.write(seq, records, chunks)
+	}
+	blocks := a.SpillSize() / block
+	s := &spiller{}
+	if err := a.Spill(s.write); err != nil {
+		t.Fatal(err)
+	}
+	// The first block pays for the file; the others go idle.
+	if want := (blocks - 1) * block; pool.Idle() != want {
+		t.Fatalf("%d bytes idle after spilling %d blocks, want %d", pool.Idle(), blocks, want)
+	}
+	before, idle := pool.Used(), pool.Idle()
+	if err := appendAll(t, b, record.Left, rec{key: []byte("b")}); err != nil {
+		t.Fatal(err)
+	}
+	if pool.Used() != before || pool.Idle() != idle-block {
+		t.Errorf("another buffer's Append took %d more and left %d idle; want an idle block taken", pool.Used()-before, pool.Idle())
+	}
+}
+
+// TestBuffer_property_spills_keep_the_order_of_ingest appends records on
+// several goroutines while the buffer spills, and checks that a merge of
+// every file and block, ordered by file then ticket, gives each key and
+// side's records in the order each goroutine appended them.
+func TestBuffer_property_spills_keep_the_order_of_ingest(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		pool := mem.NewPool(rapid.Int64Range(64<<10, 256<<10).Draw(rt, "budget"))
+		b := New(pool)
+		s := &spiller{}
+		pool.SetSource(func() []mem.Spillable { return []mem.Spillable{spillable{b, s}} })
+		writers := rapid.IntRange(1, 4).Draw(rt, "writers")
+		per := rapid.IntRange(0, 400).Draw(rt, "records per writer")
+		keys := rapid.IntRange(1, 30).Draw(rt, "keys")
+		var wg sync.WaitGroup
+		for w := range writers {
+			wg.Go(func() {
+				for i := 0; i < per; {
+					n := min(per-i, 1+(i*7+w)%13)
+					batch := make([]rec, n)
+					for j := range batch {
+						batch[j] = rec{record.Side((i + j) % 2), fmt.Appendf(nil, "k%d", (i+j)%keys), fmt.Appendf(nil, "%d/%06d", w, i+j)}
+					}
+					side := batch[0].side
+					for j := range batch {
+						batch[j].side = side
+					}
+					if err := appendAll(t, b, side, batch...); err != nil {
+						rt.Error(err)
+						return
+					}
+					i += n
+				}
 			})
-			if err != nil {
-				t.Error(err)
+		}
+		wg.Wait()
+		if _, err := b.Seal(); err != nil {
+			rt.Fatal(err)
+		}
+		snap := b.Pin()
+		defer b.Unpin()
+		var srcs []merge.Source
+		for i, f := range snap.Files {
+			srcs = append(srcs, &sliceSrc{recs: s.files[f].recs, ord: uint64(i)})
+		}
+		for i := range snap.Blocks() {
+			srcs = append(srcs, snap.Source(i, 0, record.Fences, uint64(len(snap.Files))<<32))
+		}
+		m := merge.New(srcs)
+		m.Init()
+		last := map[string]string{} // side, key and writer: the last value
+		var prev []byte
+		total := 0
+		for src := m.Top(); src != nil; src = m.Top() {
+			head := bytes.Clone(src.Head())
+			if prev != nil && record.Compare(prev, head) > 0 {
+				rt.Fatal("the merge isn't sorted")
 			}
-		}()
-		<-writing
-		// Records arrive into new chunks while the spill writes.
-		if err := b.Append(pool, 0, []byte("b"), nil); err != nil {
-			t.Fatal(err)
-		}
-		if b.SpillSize() != 0 {
-			t.Errorf("SpillSize while spilling = %d, want 0", b.SpillSize())
-		}
-		var pinned, freed bool
-		go func() {
-			files, chunks := b.Pin()
-			if len(files) != 1 || len(chunks) != 1 {
-				t.Errorf("Pin = %d files, %d chunks; want the finished spill's file and the new chunk", len(files), len(chunks))
+			prev = head
+			_, side, k, v := record.Decode(head)
+			id := fmt.Sprint(side, string(k), string(v[:1]))
+			if string(v) <= last[id] {
+				rt.Fatalf("%s: %q after %q", id, v, last[id])
 			}
-			pinned = true
-			b.Unpin()
-			b.Free(pool)
-			freed = true
-		}()
-		synctest.Wait()
-		if pinned {
-			t.Fatal("Pin returned while the spill was writing")
+			last[id] = string(v)
+			total++
+			_ = m.Pop()
 		}
-		close(release)
-		synctest.Wait()
-		if !freed || pool.Used() != 0 {
-			t.Errorf("after the spill: freed %v, %d reserved", freed, pool.Used())
+		if total != writers*per {
+			rt.Fatalf("merged %d records, appended %d", total, writers*per)
+		}
+		if pool.Used() > pool.Limit() {
+			rt.Fatalf("pool %d above its limit", pool.Used())
 		}
 	})
 }
 
-func TestBuffer_chunks_are_at_most_a_sixteenth_of_a_small_budget(t *testing.T) {
-	pool := mem.NewPool(256 << 10)
-	w := &memWrite{files: map[string][]byte{}}
-	var b Buffer
-	for i := range 2000 {
-		if err := b.Append(pool, 0, fmt.Appendf(nil, "k%d", i), make([]byte, 100)); err != nil {
-			t.Fatal(err)
-		}
-		if pool.Used() > 128<<10 {
-			if err := b.Spill(pool, w.write); err != nil {
-				t.Fatal(err)
+// spillable spills a buffer through a spiller.
+type spillable struct {
+	b *Buffer
+	s *spiller
+}
+
+func (s spillable) SpillSize() int64 { return s.b.SpillSize() }
+func (s spillable) Spill() error     { return s.b.Spill(s.s.write) }
+
+// sliceSrc is a merge.Source of whole records in memory.
+type sliceSrc struct {
+	recs [][]byte
+	ord  uint64
+	i    int
+}
+
+func (s *sliceSrc) Peek() (uint64, bool) {
+	if s.i >= len(s.recs) {
+		return 0, false
+	}
+	h, _ := record.ParseHeader(s.recs[s.i])
+	return h.Hash, true
+}
+
+func (s *sliceSrc) Head() []byte {
+	if s.i >= len(s.recs) {
+		return nil
+	}
+	return s.recs[s.i]
+}
+
+func (s *sliceSrc) Ord() uint64            { return s.ord }
+func (s *sliceSrc) Next() error            { s.i++; return nil }
+func (s *sliceSrc) Pos() int64             { return int64(s.i) }
+func (s *sliceSrc) Rewind(pos int64) error { s.i = int(pos); return nil }
+func (s *sliceSrc) ReadValue(dst []byte) error {
+	_, _, _, v := record.Decode(s.Head())
+	copy(dst, v)
+	return nil
+}
+
+func TestSnapshot_fence_bytes_and_sources_split_by_fence(t *testing.T) {
+	pool := mem.NewPool(1 << 20)
+	b := New(pool)
+	var recs []rec
+	for i := range 500 {
+		recs = append(recs, rec{record.Left, fmt.Appendf(nil, "%d", i), []byte("v")})
+	}
+	if err := appendAll(t, b, record.Left, recs...); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	snap := b.Pin()
+	defer b.Unpin()
+	var sizes [record.Fences]int64
+	snap.AddFenceBytes(&sizes)
+	var want [record.Fences]int64
+	for _, r := range recs {
+		want[record.Fence(record.Hash(r.key))] += int64(record.Len(len(r.key), len(r.value)))
+	}
+	if sizes != want {
+		t.Error("AddFenceBytes differs from the records' sizes by fence")
+	}
+	n := 0
+	for lo := 0; lo < record.Fences; lo += 64 {
+		for i := range snap.Blocks() {
+			src := snap.Source(i, lo, lo+64, 0)
+			for h, ok := src.Peek(); ok; h, ok = src.Peek() {
+				if f := record.Fence(h); f < lo || f >= lo+64 {
+					t.Fatalf("a record of fence %d in the source of fences %d to %d", f, lo, lo+64)
+				}
+				n++
+				_ = src.Next()
 			}
 		}
 	}
-	for _, c := range b.Chunks() {
-		if cap(c) > 16<<10 {
-			t.Errorf("a chunk of %d bytes, above a sixteenth of the 256 KiB budget", cap(c))
-		}
-	}
-}
-
-func TestRecordLen_needs_the_whole_header(t *testing.T) {
-	rec := AppendRecord(nil, 7, bytes.Repeat([]byte{'k'}, 200), bytes.Repeat([]byte{'v'}, 300))
-	header := 8 + 2 + 2
-	for n := range len(rec) + 1 {
-		l, ok := RecordLen(rec[:n])
-		if ok != (n >= header) || ok && l != len(rec) {
-			t.Errorf("RecordLen of %d bytes = %d, %v; want %d, %v", n, l, ok, len(rec), n >= header)
-		}
-	}
-	corrupt := append(make([]byte, 8), bytes.Repeat([]byte{0xff}, MaxHeader)...)
-	if _, ok := RecordLen(corrupt); ok {
-		t.Error("RecordLen of an overflowing length succeeded")
-	}
-}
-
-func TestAddFile_adds_to_the_totals(t *testing.T) {
-	var b Buffer
-	b.AddFile(spill.File{Path: "0.rec", Records: 3, Bytes: 100})
-	b.AddFile(spill.File{Path: "1.rec", Records: 2, Bytes: 50})
-	if b.Records() != 5 || b.Bytes() != 150 || len(b.Files()) != 2 {
-		t.Errorf("%d records, %d bytes, %d files after two AddFiles", b.Records(), b.Bytes(), len(b.Files()))
+	if n != len(recs) {
+		t.Errorf("the sources of four fence ranges hold %d records, want %d", n, len(recs))
 	}
 }

@@ -1,49 +1,68 @@
-// Package join joins a sealed run's buffers into Venn-labelled results
-// (§8.4, §8.5).
+// Package join streams the full outer join of a sealed run as
+// Venn-labelled results (§8.4, §8.5).
 //
-// The buckets are planned into units: contiguous bucket ranges whose
-// estimated working set, record bytes times ExpansionFactor, fills up to
-// the unit budget, the memory limit divided by the join parallelism. Each
-// unit is loaded from its buffers and spill files, every record gets an
-// index entry of its hash and position, the entries are sorted by hash,
-// then key bytes, then side, and one pass over them emits left_only,
-// right_only and both results in that deterministic order, without a hash
-// map.
+// A run's records are in sorted run files, and, if it never spilled, in
+// sorted blocks in memory. The join never loads anything: each of its
+// workers merges a range of fences of every file and block with a loser
+// tree, in (hash, key, side, ingest) order, through one read buffer per
+// file, and emits results as the records stream by. A key's left records
+// are held, in the worker's arena, until its first right record, or the
+// next key, shows whether they are a Match or left_only results; a right
+// record with no left ones held is a right_only result at once. Empty keys
+// hash to 0, sort first, and are one-sided results.
 //
-// A bucket whose estimate alone exceeds the unit budget is oversized. A
-// counting scan looks for a key whose records exceed the budget, or whose
-// Match would exceed the maximum match size, and the Join fails with a
-// HotKeyError naming it. Otherwise the bucket is re-partitioned into
-// sub-buckets with the seed of the next depth, written to files under the
-// run's join-<n> directory, and joined like the run's own buckets, down to
-// MaxDepth, one sub-unit after another. The empty-key partitions come
-// last, one more unit streamed as one-sided results in ingest order.
+// So a Join holds one key at a time. A key is limited only by its Match:
+// a Match larger than the maximum match size fails the Join with a
+// HotKeyError naming the key. A key on one side only streams at any size:
+// once its records held reach the maximum, the worker scans to the end of
+// the key without keeping it, and if the scan finds no right record, emits
+// the held ones, goes back to where the scan began, and streams the rest.
 //
-// Up to the join parallelism of units run at once, each on a worker that
-// hands its batches to a single sender. Within a unit the batches are
-// deterministic; batches of different units interleave.
+// The fences are planned into tasks of about equal bytes, several per
+// worker; a worker takes the next task once it is done with one. Each
+// worker fills an output batch of its own and hands it to the goroutine
+// that called Run, which sends every batch, one at a time, so a slow
+// client holds up the workers and memory doesn't grow. The batches of a
+// task depend on the data and the plan alone, not on which worker took the
+// task; batches of different tasks interleave.
 package join
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
-	"math"
-	"slices"
+	"os"
 	"sync"
 	"sync/atomic"
-	"unsafe"
 
-	"google.golang.org/protobuf/encoding/protowire"
-	"google.golang.org/protobuf/proto"
+	"github.com/z5labs/humus"
 
 	reconv1 "poc/gen/recon/v1"
 	"poc/internal/buffer"
 	"poc/internal/mem"
+	"poc/internal/merge"
+	"poc/internal/record"
 	"poc/internal/spill"
+)
+
+const (
+	// maxReadBuf is the largest read buffer of a cursor.
+	maxReadBuf = 256 << 10
+	// goodReadBuf is the smallest read buffer a Join takes before it gives
+	// up workers instead.
+	goodReadBuf = 32 << 10
+	// minReadBuf is the smallest read buffer a Join or merge works with.
+	minReadBuf = spill.Align
+	// mergeReadBuf is the read buffer Compact merges files down to: until
+	// one worker could read them all with buffers of this size.
+	mergeReadBuf = 16 << 10
+	// readSharePct is the share of the budget read buffers may take.
+	readSharePct = 50
+	// tasksPerWorker is how many tasks the plan has per worker.
+	tasksPerWorker = 8
+	// sourceBytes is the memory a merge source takes besides its buffer.
+	sourceBytes = 256
 )
 
 // ErrControlTotals is returned when the join accounted for a different
@@ -54,9 +73,8 @@ var ErrControlTotals = errors.New("control totals mismatch")
 // reach the ErrControlTotals path.
 var dropRecord atomic.Bool
 
-// ExpansionFactor is the planner's estimate of a unit's working set per
-// byte of its records (§8.4).
-const ExpansionFactor = 2
+// errStopped ends the tasks after one that failed.
+var errStopped = errors.New("join: an earlier task failed")
 
 // Filter is the set of states a Join returns.
 type Filter [4]bool
@@ -75,175 +93,278 @@ func NewFilter(states []reconv1.JoinState) Filter {
 }
 
 // oneSided reports whether f returns the one-sided results of side.
-func (f Filter) oneSided(side buffer.Side) bool {
-	if side == buffer.Left {
+func (f Filter) oneSided(side record.Side) bool {
+	if side == record.Left {
 		return f[reconv1.JoinState_JOIN_STATE_LEFT_ONLY]
 	}
 	return f[reconv1.JoinState_JOIN_STATE_RIGHT_ONLY]
 }
 
-// Options configure Run.
+// HotKeyError is the failure of a Join because one key's Match would be
+// larger than the maximum match size (§8.4).
+type HotKeyError struct {
+	Key         []byte
+	Left, Right uint64 // the key's records per side
+	Size, Limit int64  // the Match's encoded size, and the most it may be
+}
+
+func (e *HotKeyError) Error() string {
+	return fmt.Sprintf("a key's Match of %d left and %d right values is %d bytes, more than the maximum match size of %d bytes",
+		e.Left, e.Right, e.Size, e.Limit)
+}
+
+func hotKey(key []byte, left, right uint64, size, limit int64) *HotKeyError {
+	return &HotKeyError{Key: bytes.Clone(key), Left: left, Right: right, Size: size, Limit: limit}
+}
+
+// Options configure Run and Compact.
 type Options struct {
 	Filter Filter
 	// OutputBatchBytes is the size at which a batch is sent.
 	OutputBatchBytes int64
 	// Totals is the number of records per side the run sealed with.
 	Totals [2]uint64
-	// Parallelism divides the memory limit into the unit budget.
+	// Parallelism is the number of workers a Join wants.
 	Parallelism int
-	// MaxMatchBytes is the largest Match a Join may send; 0 means no
-	// limit.
+	// MaxMatchBytes is the largest Match a Join may send; 0 means a
+	// worker's share of the budget, a quarter of it.
 	MaxMatchBytes int64
-	// Scratch holds the files of sub-partitioned buckets.
-	Scratch Scratch
-	// Log receives the sub-partition events; nil discards them.
-	Log *slog.Logger
 }
 
-// Scratch is where a Join writes the sub-partitions of oversized buckets:
-// a directory of the run's, which the run's deletion removes.
-type Scratch interface {
-	// Write writes chunks, which hold records records, to a new file at
-	// path, relative to the run's directory, like spill.Disk.Write.
-	Write(path string, records int64, chunks [][]byte) (spill.File, error)
-	// Remove removes dir, relative to the run's directory, with the files
-	// in it, and gives back the bytes they took on disk.
-	Remove(dir string, bytes int64) error
+// MaxMatch returns the largest Match a Join may send under a budget of
+// limit bytes.
+func MaxMatch(limit int64, opts Options) int64 {
+	if opts.MaxMatchBytes > 0 {
+		return opts.MaxMatchBytes
+	}
+	return max(limit/int64(4*max(opts.Parallelism, 1)), opts.OutputBatchBytes)
 }
 
 // Stats describe a finished Run.
 type Stats struct {
-	Units         int // join units, sub-buckets' included, not the empty-key unit
-	Subpartitions int // oversized buckets that were re-partitioned
-
-	// RecordBytes is the encoded bytes of the units' records, and
-	// WorkingSet what holding them took: their chunks in memory, their
-	// spill files read, and the index.
-	RecordBytes, WorkingSet int64
-	// Largest is the unit whose working set was largest.
-	Largest struct{ RecordBytes, WorkingSet int64 }
+	Files, Blocks  int // merged by each worker
+	Workers, Tasks int
+	ReadBuffer     int   // bytes of one cursor's read buffer
+	ReadBytes      int64 // reserved for read buffers
+	Reads          int64 // preads
+	Batches        int64
+	Streamed       int64 // one-sided keys too large for a Match, streamed
+	MaxMatch       int64
 }
 
-func (s *Stats) add(o Stats) {
-	s.Units += o.Units
-	s.Subpartitions += o.Subpartitions
-	s.RecordBytes += o.RecordBytes
-	s.WorkingSet += o.WorkingSet
-	if o.Largest.WorkingSet > s.Largest.WorkingSet {
-		s.Largest = o.Largest
+// task is fences lo to hi-1, merged by one worker.
+type task struct{ lo, hi int }
+
+// plan cuts the fences into at most n tasks of about equal bytes, given the
+// bytes of each fence. It depends only on its arguments.
+func plan(sizes []int64, n int) []task {
+	var total int64
+	for _, s := range sizes {
+		total += s
 	}
-}
-
-// unit records the record bytes and working set of a unit.
-func (s *Stats) unit(records, working int64) {
-	s.Units++
-	s.RecordBytes += records
-	s.WorkingSet += working
-	if working > s.Largest.WorkingSet {
-		s.Largest.RecordBytes, s.Largest.WorkingSet = records, working
+	if total == 0 || n < 1 {
+		return nil
 	}
-}
-
-// Unit is the buckets Lo to Hi-1, joined together.
-type Unit struct {
-	Lo, Hi uint32
-}
-
-// Plan groups buckets with the given record bytes into units of
-// contiguous buckets, each filled greedily while its estimate stays within
-// budget. A bucket whose estimate alone exceeds budget is a unit of its
-// own. The plan depends only on its arguments.
-func Plan(sizes []int64, budget int64) []Unit {
-	var units []Unit
+	var tasks []task
 	var lo int
-	var estimate int64
-	for i, size := range sizes {
-		if i > lo && estimate+size*ExpansionFactor > budget {
-			units = append(units, Unit{uint32(lo), uint32(i)})
-			lo, estimate = i, 0
+	var sum, part int64 // bytes so far, and of the task being filled
+	for i, s := range sizes {
+		sum += s
+		part += s
+		// Cut after fence i once the tasks so far hold their share.
+		if last := i == len(sizes)-1; last || part > 0 && sum*int64(n) >= total*int64(len(tasks)+1) {
+			if part > 0 || len(tasks) == 0 {
+				tasks = append(tasks, task{lo, i + 1})
+			} else {
+				tasks[len(tasks)-1].hi = i + 1 // empty fences at the end
+			}
+			lo, part = i+1, 0
 		}
-		estimate += size * ExpansionFactor
 	}
-	if len(sizes) > 0 {
-		units = append(units, Unit{uint32(lo), uint32(len(sizes))})
+	return tasks
+}
+
+// workerBytes is what a worker may take besides its read buffers and the
+// batch reserved for it: room for its largest Match, its emitter's structs
+// and slack. A Match is held once, in arena chunks, with a slice of 24
+// bytes per value besides: twice the maximum match size covers values of
+// 22 bytes and more, and a worker holds no more than that.
+func workerBytes(maxMatch, batch int64) int64 { return 2*maxMatch + emitterBytes(batch) }
+
+// maxWorkers returns how many of want workers a budget of limit bytes
+// runs: no more than whose batches and largest Matches take three quarters
+// of it, and at least one.
+func maxWorkers(limit int64, want int, maxMatch, batch int64) int {
+	for want > 1 && int64(want)*(batch+workerBytes(maxMatch, batch)) > limit*3/4 {
+		want--
 	}
-	return units
+	return want
 }
 
-// entry indexes one record: its hash and where it is.
-type entry struct {
-	hash  uint64
-	chunk uint32 // index into the unit's chunks
-	off   uint32 // offset of the record in its chunk
+// readBudget returns the bytes the read buffers of workers workers may
+// take: the share of the budget set for them, less if the pool's memory is
+// held by what it can't spill, or if the workers' largest Matches wouldn't
+// fit next to them with an eighth of the budget to spare, but at least a
+// quarter of the budget. The floor lets a Join run while other runs hold
+// memory, at the risk of running out if every worker meets a Match of the
+// largest size at once.
+func readBudget(pool *mem.Pool, workers int, maxMatch, batch int64) int64 {
+	limit := pool.Limit()
+	free := pool.Free() - int64(workers)*workerBytes(maxMatch, batch) - limit/8
+	return min(max(free, limit/4), limit*readSharePct/100)
 }
 
-const entrySize = int64(unsafe.Sizeof(entry{}))
-
-// chunk is whole records of one side: a buffer chunk, or a spill file or
-// part of one.
-type chunk struct {
-	data []byte
-	side buffer.Side
-	// streamed is set for part of a file read through a buffer that is
-	// reused once the chunk has been handled.
-	streamed bool
+// readBuffer returns the size of a read buffer when workers workers each
+// read files files.
+func readBuffer(pool *mem.Pool, workers, files int, maxMatch, batch int64) int {
+	return int(min(readBudget(pool, workers, maxMatch, batch)/int64(workers*files), maxReadBuf)) &^ (spill.Align - 1)
 }
 
-// Run joins parts, whose spill files are on disk, and sends the results in
-// batches of about opts.OutputBatchBytes.
+// Run streams the full outer join of buf, which is sealed, and sends the
+// results in batches of about opts.OutputBatchBytes.
 //
-// Up to opts.Parallelism workers join the units of the plan, each taking
-// the next unit in order once it is done with one, and the empty-key unit
-// last. Each worker fills an output batch of its own and hands it to the
-// goroutine that called Run, which sends every batch, one at a time, so a
-// slow client holds up the workers. A worker waits until its batch is sent
-// before it goes on, because the batch points into the unit's memory.
+// The workers' memory is reserved from pool before buf is pinned: if it
+// doesn't fit next to the blocks of a run still in memory, the reservation
+// spills them, and the Join reads the file instead. Fewer workers run than
+// opts.Parallelism if their largest Matches together would take more than
+// three quarters of the budget. Then each worker gets a read buffer per
+// file, as large as the budget allows, and fewer workers run before the
+// buffers get small. Run fails with the error of pool.Reserve when even
+// one worker can't have read buffers of minReadBuf bytes.
 //
-// Memory for the workers' output batches and for each unit's working set
-// is reserved from pool, so Run fails with the error of pool.Reserve when
-// the budget can't hold them. It returns context.Cause(ctx) once ctx is
-// done, the error of a failed send, a *HotKeyError, or ErrControlTotals.
-// When units fail, the error is that of the first of them in the plan, so
-// it doesn't depend on which worker got there first.
-func Run(ctx context.Context, pool *mem.Pool, disk *spill.Disk, parts *buffer.Partitions, opts Options, send func(*reconv1.JoinResponse) error) (Stats, error) {
-	log := opts.Log
-	if log == nil {
-		log = slog.New(slog.DiscardHandler)
+// A batch is valid only until send returns: its memory is used for the
+// next one. grpc-go's SendMsg encodes the message before it returns.
+//
+// It returns context.Cause(ctx) once ctx is done, the error of a failed
+// send, a *HotKeyError, or ErrControlTotals. When tasks fail, the error is
+// that of the first of them in the plan, so it doesn't depend on which
+// worker got there first.
+func Run(ctx context.Context, pool *mem.Pool, fsys humus.FS, buf *buffer.Buffer, opts Options, send func(*reconv1.JoinResponse) error) (Stats, error) {
+	batch := opts.OutputBatchBytes
+	maxMatch := MaxMatch(pool.Limit(), opts)
+	want := maxWorkers(pool.Limit(), max(opts.Parallelism, 1), maxMatch, batch)
+	var reserved int64
+	defer func() { pool.Release(reserved) }()
+	reserve := func(n int64) error {
+		if err := pool.Reserve(n); err != nil {
+			return err
+		}
+		reserved += n
+		return nil
 	}
-	sh := &shared{
-		pool:     pool,
-		disk:     disk,
-		scratch:  opts.Scratch,
-		log:      log,
-		budget:   pool.Limit() / int64(max(opts.Parallelism, 1)),
-		maxMatch: opts.MaxMatchBytes,
-		f:        opts.Filter,
-	}
-	sh.drop.Store(dropRecord.Swap(false))
-	tasks := sh.tasks(parts)
 
-	workers := min(max(opts.Parallelism, 1), len(tasks))
-	batches := int64(workers) * opts.OutputBatchBytes
-	if err := pool.Reserve(batches); err != nil {
-		return Stats{}, err
+	// The probe is what the workers will take besides their arenas: their
+	// Matches, and read buffers of a good size for the files there are,
+	// and one more if the run is spilled to make room.
+	arenas := int64(want) * batch
+	nfiles := int64(len(buf.Files()) + 1)
+	room := min(int64(want)*(workerBytes(maxMatch, batch)+nfiles*goodReadBuf), pool.Limit()*3/4)
+	if err := reserve(arenas + room); err != nil {
+		// Only a probe: whatever it couldn't spill, the Join may still have
+		// room for, reading the run where it is.
+		room = 0
+		if err := reserve(arenas); err != nil {
+			return Stats{}, err
+		}
 	}
-	defer pool.Release(batches)
+	snap := buf.Pin()
+	defer buf.Unpin()
+	pool.Release(room)
+	reserved -= room
+
+	files := snap.Files
+	var sizes [record.Fences]int64
+	for _, f := range files {
+		for i := range sizes {
+			sizes[i] += f.Fences[i+1] - f.Fences[i]
+		}
+	}
+	snap.AddFenceBytes(&sizes)
+	tasks := plan(sizes[:], want*tasksPerWorker)
+	st := Stats{Files: len(files), Blocks: snap.Blocks(), Tasks: len(tasks), MaxMatch: maxMatch}
+	workers := min(want, len(tasks))
+	var opened []*os.File
+	defer func() {
+		for _, f := range opened {
+			_ = f.Close()
+		}
+	}()
+	if len(files) > 0 && workers > 0 {
+		for workers > 1 && readBuffer(pool, workers, len(files), maxMatch, batch) < goodReadBuf {
+			workers--
+		}
+		st.ReadBuffer = readBuffer(pool, workers, len(files), maxMatch, batch)
+		if st.ReadBuffer < minReadBuf {
+			return st, fmt.Errorf("%w: a Join of %d run files needs read buffers of %d bytes each, and may take %d bytes",
+				mem.ErrExhausted, len(files), minReadBuf, readBudget(pool, 1, maxMatch, batch))
+		}
+		st.ReadBytes = int64(workers) * int64(len(files)) * int64(st.ReadBuffer)
+		if err := reserve(st.ReadBytes); err != nil {
+			return st, err
+		}
+		for _, f := range files {
+			r, err := spill.Open(fsys, f)
+			if err != nil {
+				if ctx.Err() != nil { // the run was deleted, its files with it
+					return st, context.Cause(ctx)
+				}
+				return st, err
+			}
+			opened = append(opened, r)
+		}
+	}
+	// The arenas of the workers the plan left out.
+	if extra := int64(want-workers) * batch; extra > 0 {
+		pool.Release(extra)
+		reserved -= extra
+	}
+	st.Workers = workers
+	fan := len(files) + snap.Blocks()
+	if err := reserve(int64(workers)*(merge.Bytes(fan)+int64(fan)*sourceBytes) + int64(len(tasks))*16); err != nil {
+		return st, err
+	}
 
 	sends := make(chan sendRequest)
 	sched := newSchedule(ctx, len(tasks))
-	joiners := make([]*joiner, workers)
+	ws := make([]*worker, workers)
 	var wg sync.WaitGroup
-	for w := range joiners {
-		j := &joiner{shared: sh, out: &batcher{sends: sends, sent: make(chan error, 1), limit: opts.OutputBatchBytes}}
-		joiners[w] = j
+	drop := dropRecord.Swap(false)
+	for i := range ws {
+		w := &worker{
+			pool:     pool,
+			snap:     snap,
+			files:    files,
+			f:        opts.Filter,
+			maxMatch: maxMatch,
+			e:        newEmitter(pool, opts.Filter, batch, sends, batch),
+			save:     make([]int64, fan),
+		}
+		w.drop.Store(drop && i == 0)
+		reserved -= batch // the emitter's to release
+		srcs := make([]merge.Source, fan)
+		if len(files) > 0 {
+			slab := make([]byte, len(files)*st.ReadBuffer)
+			for r := range files {
+				rb := slab[r*st.ReadBuffer : (r+1)*st.ReadBuffer : (r+1)*st.ReadBuffer]
+				c := spill.NewCursor(opened[r], uint64(r), rb, w.grow)
+				w.cursors = append(w.cursors, c)
+				srcs[r] = c
+			}
+		}
+		w.m = merge.New(srcs)
+		ws[i] = w
 		wg.Go(func() {
 			for {
-				i, ctx, ok := sched.take()
+				t, tctx, ok := sched.take()
 				if !ok {
 					return
 				}
-				j.ctx, j.out.ctx = ctx, ctx
-				sched.done(i, tasks[i](j))
+				w.ctx, w.e.ctx = tctx, tctx
+				err := w.run(tasks[t])
+				if err != nil && tctx.Err() != nil {
+					err = context.Cause(tctx)
+				}
+				sched.done(t, err)
 			}
 		})
 	}
@@ -252,69 +373,39 @@ func Run(ctx context.Context, pool *mem.Pool, disk *spill.Disk, parts *buffer.Pa
 		close(sends)
 	}()
 	// grpc-go doesn't allow concurrent sends on a stream. After a failed
-	// send every batch fails the same way, and the workers stop.
+	// send every batch fails the same way, and the workers stop. Once ctx
+	// is done nothing more is sent, though a worker had a batch queued.
 	var sendErr error
 	for r := range sends {
+		if sendErr == nil && ctx.Err() != nil {
+			sendErr = context.Cause(ctx)
+		}
 		if sendErr == nil {
 			sendErr = send(r.resp)
 		}
 		r.sent <- sendErr
 	}
-	if sched.err != nil {
-		return Stats{}, sched.err
-	}
 
-	var stats Stats
 	var counts [2]uint64
-	for _, j := range joiners {
-		stats.add(j.stats)
-		counts[buffer.Left] += j.counts[buffer.Left]
-		counts[buffer.Right] += j.counts[buffer.Right]
+	for _, w := range ws {
+		w.e.release()
+		pool.Release(w.extra)
+		counts[record.Left] += w.counts[record.Left]
+		counts[record.Right] += w.counts[record.Right]
+		st.Batches += w.e.batches
+		st.Streamed += w.streamed
+		for _, c := range w.cursors {
+			st.Reads += c.Reads()
+		}
+	}
+	if sched.err != nil {
+		return st, sched.err
 	}
 	if counts != opts.Totals {
-		return Stats{}, fmt.Errorf("%w: joined %d left and %d right records, sealed with %d and %d",
-			ErrControlTotals, counts[buffer.Left], counts[buffer.Right], opts.Totals[buffer.Left], opts.Totals[buffer.Right])
+		return st, fmt.Errorf("%w: joined %d left and %d right records, sealed with %d and %d",
+			ErrControlTotals, counts[record.Left], counts[record.Right], opts.Totals[record.Left], opts.Totals[record.Right])
 	}
-	return stats, nil
-}
-
-// shared is the state of a Join that its workers share.
-type shared struct {
-	pool     *mem.Pool
-	disk     *spill.Disk
-	scratch  Scratch
-	log      *slog.Logger
-	budget   int64 // of a unit
-	maxMatch int64
-	f        Filter
-	drop     atomic.Bool  // the test hook's
-	subparts atomic.Int64 // join-<n> directories made
-}
-
-// joiner is a worker of a Join. Its methods run on the worker's goroutine.
-type joiner struct {
-	*shared
-	ctx    context.Context // of the task in progress
-	out    *batcher
-	counts [2]uint64
-	stats  Stats
-}
-
-// task is a unit of the plan for a worker to join.
-type task func(*joiner) error
-
-// tasks returns the units of the plan of parts' buckets, then the empty-key
-// unit if the run has empty keys.
-func (sh *shared) tasks(parts *buffer.Partitions) []task {
-	sizes := bucketSizes(parts)
-	var tasks []task
-	for _, u := range Plan(sizes, sh.budget) {
-		tasks = append(tasks, func(j *joiner) error { return j.joinPlanned(parts, sizes, u, 0) })
-	}
-	if parts.Empty(buffer.Left).Records()+parts.Empty(buffer.Right).Records() > 0 {
-		tasks = append(tasks, func(j *joiner) error { return j.emitEmpty(parts) })
-	}
-	return tasks
+	return st, nil
 }
 
 // schedule hands out tasks in order and keeps the error of the first one
@@ -340,7 +431,10 @@ func newSchedule(ctx context.Context, tasks int) *schedule {
 func (s *schedule) take() (int, context.Context, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.next >= s.failed {
+	if s.next >= s.failed || s.ctx.Err() != nil {
+		if s.ctx.Err() != nil && s.err == nil && s.next < s.failed {
+			s.failed, s.err = s.next, context.Cause(s.ctx)
+		}
 		return 0, nil, false
 	}
 	i := s.next
@@ -356,358 +450,228 @@ func (s *schedule) done(i int, err error) {
 	defer s.mu.Unlock()
 	s.cancels[i](nil)
 	delete(s.cancels, i)
-	if err == nil || i > s.failed {
+	if err == nil || i > s.failed || errors.Is(err, errStopped) {
 		return
 	}
 	s.failed, s.err = i, err
 	for k, cancel := range s.cancels {
 		if k > i {
-			cancel(err)
+			cancel(errStopped)
 		}
 	}
 }
 
-// bucketSizes returns the record bytes of each bucket of parts.
-func bucketSizes(parts *buffer.Partitions) []int64 {
-	sizes := make([]int64, parts.Buckets())
-	for i := range sizes {
-		sizes[i] = parts.Bucket(buffer.Left, uint32(i)).Bytes() + parts.Bucket(buffer.Right, uint32(i)).Bytes()
-	}
-	return sizes
+// worker merges tasks, one after another, into its emitter. Its methods run
+// on its goroutine.
+type worker struct {
+	pool     *mem.Pool
+	ctx      context.Context // of the task in progress
+	snap     *buffer.Snapshot
+	files    []*spill.File
+	cursors  []*spill.Cursor
+	m        *merge.Merger
+	e        *emitter
+	f        Filter
+	maxMatch int64
+	save     []int64 // the sources' positions, for a rewind
+	extra    int64   // reserved for read buffers that grew
+	drop     atomic.Bool
+
+	// A key with more left records than a Match may hold, and no right
+	// ones, is streamed: its records are left_only results one by one.
+	streaming bool
+	shash     uint64
+	skey      []byte
+	// unbound is set for a group that is a Match within the maximum size
+	// whose values take more memory than a worker holds one in: it is held
+	// anyway, as far as the pool allows.
+	unbound bool
+
+	counts   [2]uint64
+	streamed int64
 }
 
-// joinBuckets joins the buckets of parts, which are sub-buckets of depth
-// depth, one unit after another.
-func (j *joiner) joinBuckets(parts *buffer.Partitions, depth int) error {
-	sizes := bucketSizes(parts)
-	for _, u := range Plan(sizes, j.budget) {
-		if err := j.joinPlanned(parts, sizes, u, depth); err != nil {
+// grow returns a reserved buffer of n bytes, for a cursor whose record's
+// header and key don't fit its read buffer.
+func (w *worker) grow(n int) ([]byte, error) {
+	if err := w.pool.Reserve(int64(n)); err != nil {
+		return nil, err
+	}
+	w.extra += int64(n)
+	return make([]byte, n), nil
+}
+
+// open points the worker's sources at the task's fences.
+func (w *worker) open(t task) error {
+	for i, c := range w.cursors {
+		off, end := w.files[i].Segment(t.lo, t.hi)
+		if err := c.Reset(off, end); err != nil {
 			return err
 		}
 	}
+	srcs := w.m.Sources()
+	base := uint64(len(w.files)) << 32
+	for b := range w.snap.Blocks() {
+		srcs[len(w.files)+b] = w.snap.Source(b, t.lo, t.hi, base)
+	}
+	w.m.Init()
 	return nil
 }
 
-// joinPlanned joins unit u of parts, whose buckets have sizes and are of
-// depth depth: re-partitioned if it is an oversized bucket, else loaded.
-func (j *joiner) joinPlanned(parts *buffer.Partitions, sizes []int64, u Unit, depth int) error {
-	if u.Hi-u.Lo == 1 && sizes[u.Lo]*ExpansionFactor > j.budget && depth < MaxDepth {
-		return j.oversized(parts, u.Lo, depth)
-	}
-	return j.load(bucketsOf(parts, u.Lo, u.Hi), j.joinUnit)
-}
-
-// bucketsOf returns the buffers of buckets lo to hi-1, left before right.
-func bucketsOf(parts *buffer.Partitions, lo, hi uint32) []sided {
-	var bufs []sided
-	for s := range 2 {
-		for i := lo; i < hi; i++ {
-			bufs = append(bufs, sided{parts.Bucket(buffer.Side(s), i), buffer.Side(s)})
-		}
-	}
-	return bufs
-}
-
-// sided is a buffer and its side.
-type sided struct {
-	b    *buffer.Buffer
-	side buffer.Side
-}
-
-// pinned is a pinned buffer and the records it held when it was pinned.
-type pinned struct {
-	b     *buffer.Buffer
-	side  buffer.Side
-	files []spill.File
-	mem   [][]byte
-}
-
-// pin pins bufs. It returns them with the bytes of their spill files and
-// of their in-memory chunks, and their number of records.
-func pin(bufs []sided) (pins []pinned, inFiles, inMemory, records int64) {
-	for _, b := range bufs {
-		files, mem := b.b.Pin()
-		pins = append(pins, pinned{b.b, b.side, files, mem})
-		for _, f := range files {
-			inFiles += f.Bytes
-		}
-		for _, c := range mem {
-			inMemory += int64(len(c))
-		}
-		records += b.b.Records()
-	}
-	return pins, inFiles, inMemory, records
-}
-
-func unpin(pins []pinned) {
-	for _, p := range pins {
-		p.b.Unpin()
-	}
-}
-
-// load loads bufs, the left buffers before the right ones, and calls fn
-// with their chunks in that order, each buffer's in ingest order. It pins
-// the buffers and reserves what loading adds to the memory they hold, their
-// spill files once read and an index entry per record, so that the
-// reservation doesn't spill the buffers it is about to read. The results fn
-// adds are sent before the memory is released.
-func (j *joiner) load(bufs []sided, fn func(chunks []chunk, records int64) error) error {
-	pins, inFiles, inMemory, records := pin(bufs)
-	need := inFiles + records*entrySize
-	if err := j.pool.Reserve(need); err != nil {
-		// Pinned, the buffers hold their chunks' full capacity; spilled,
-		// they need only their bytes back. So reserve as if every record
-		// were in a file, which may spill the buffers themselves, and give
-		// back the share of the chunks still in memory once pinned again.
-		unpin(pins)
-		upper := need + inMemory
-		if err := j.pool.Reserve(upper); err != nil {
-			return err
-		}
-		pins, inFiles, inMemory, _ = pin(bufs)
-		need = inFiles + records*entrySize
-		j.pool.Release(upper - need)
-	}
-	defer func() { unpin(pins) }()
-	defer j.pool.Release(need)
-
-	working := need
-	for _, p := range pins {
-		for _, c := range p.mem {
-			working += int64(cap(c))
-		}
-	}
-	j.stats.unit(inFiles+inMemory, working)
-
-	var chunks []chunk
-	for _, p := range pins {
-		for _, f := range p.files {
-			if err := j.ctx.Err(); err != nil {
-				return context.Cause(j.ctx)
-			}
-			data, err := j.disk.Read(f)
-			if err != nil {
-				if j.ctx.Err() != nil { // the run was deleted, its files with it
-					return context.Cause(j.ctx)
-				}
-				return err
-			}
-			chunks = append(chunks, chunk{data: data, side: p.side})
-		}
-		for _, c := range p.mem {
-			chunks = append(chunks, chunk{data: c, side: p.side})
-		}
-	}
-	if err := fn(chunks, records); err != nil {
+// run joins one task: it merges the task's records and emits results as
+// they go by. The batch is sent at the end of the task, so that the
+// batches depend on the plan alone, not on which worker took which task.
+func (w *worker) run(t task) error {
+	if err := w.open(t); err != nil {
 		return err
 	}
-	return j.out.flush()
-}
-
-// joinUnit indexes, sorts and emits the records of one unit.
-func (j *joiner) joinUnit(data []chunk, records int64) error {
-	// Left chunks come before right ones, so for one key the entries of a
-	// lower chunk index are left's, and within a side they are in ingest
-	// order. A file larger than an offset can address is split in parts.
-	var chunks []chunk
-	entries := make([]entry, 0, records)
-	for _, d := range data {
-		start := 0
-		chunks = append(chunks, d)
-		for off := 0; off < len(d.data); {
-			if off-start > math.MaxUint32 {
-				start = off
-				chunks = append(chunks, chunk{data: d.data[start:], side: d.side})
+	m, e := w.m, w.e
+	for n := 1; ; n++ {
+		src := m.Top()
+		if src == nil {
+			break
+		}
+		if n&4095 == 0 && w.ctx.Err() != nil {
+			return context.Cause(w.ctx)
+		}
+		head := src.Head()
+		h, _ := record.ParseHeader(head)
+		key := head[h.Len : h.Len+h.KeyLen]
+		if w.drop.Load() {
+			w.drop.Store(false)
+			if err := m.Pop(); err != nil {
+				return err
 			}
-			hash, _, _, next := buffer.Decode(d.data, off)
-			entries = append(entries, entry{hash: hash, chunk: uint32(len(chunks) - 1), off: uint32(off - start)})
-			off = next
+			continue
 		}
-	}
-	key := func(e entry) []byte {
-		_, k, _, _ := buffer.Decode(chunks[e.chunk].data, int(e.off))
-		return k
-	}
-	value := func(e entry) []byte {
-		_, _, v, _ := buffer.Decode(chunks[e.chunk].data, int(e.off))
-		return v
-	}
-	slices.SortFunc(entries, func(a, b entry) int {
-		if c := cmp.Compare(a.hash, b.hash); c != 0 {
-			return c
-		}
-		if c := bytes.Compare(key(a), key(b)); c != 0 {
-			return c
-		}
-		return cmp.Or(cmp.Compare(a.chunk, b.chunk), cmp.Compare(a.off, b.off))
-	})
-
-	f := j.f
-	for i, groups := 0, 0; i < len(entries); groups++ {
-		// A unit whose results are all filtered out sends nothing, so ctx
-		// is checked here too, not only by flush.
-		if groups%4096 == 0 && j.ctx.Err() != nil {
-			return context.Cause(j.ctx)
-		}
-		k := key(entries[i])
-		end := i + 1
-		for end < len(entries) && entries[end].hash == entries[i].hash && bytes.Equal(key(entries[end]), k) {
-			end++
-		}
-		group := entries[i:end]
-		if j.drop.Load() && j.drop.CompareAndSwap(true, false) {
-			group = group[1:]
-		}
-		nl := 0
-		for nl < len(group) && chunks[group[nl].chunk].side == buffer.Left {
-			nl++
-		}
-		j.counts[buffer.Left] += uint64(nl)
-		j.counts[buffer.Right] += uint64(len(group) - nl)
+		var err error
 		switch {
-		case nl > 0 && nl < len(group):
-			if j.maxMatch > 0 {
-				size := matchKeySize(len(k))
-				for _, e := range group {
-					size += matchValueSize(len(value(e)))
-				}
-				if size > j.maxMatch {
-					return hotMatch(k, uint64(nl), uint64(len(group)-nl), size, j.maxMatch)
-				}
+		case len(key) == 0:
+			// An empty key never matches: a one-sided result per record.
+			if err = e.finish(w.maxMatch); err == nil {
+				err = w.single(src, h, key)
 			}
-			if f[reconv1.JoinState_JOIN_STATE_BOTH] {
-				m := &reconv1.Match{Key: k, Left: make([][]byte, 0, nl), Right: make([][]byte, 0, len(group)-nl)}
-				for _, e := range group[:nl] {
-					m.Left = append(m.Left, value(e))
-				}
-				for _, e := range group[nl:] {
-					m.Right = append(m.Right, value(e))
-				}
-				if err := j.out.add(&reconv1.JoinResult{Result: &reconv1.JoinResult_Both{Both: m}}); err != nil {
+		case w.streaming && h.Hash == w.shash && bytes.Equal(key, w.skey):
+			err = w.single(src, h, key)
+		case e.matching(h.Hash, key):
+			if e.hold && (e.gsize+bytesField(h.ValLen) > w.maxMatch || !w.unbound && e.held(h.ValLen) > 2*w.maxMatch) {
+				if err := w.overflow(); err != nil {
 					return err
 				}
+				continue // the merge is back at this record, or past the key
 			}
+			err = e.add(h.Side, h.ValLen, src)
 		default:
-			for _, e := range group {
-				if err := j.out.oneSided(f, chunks[e.chunk].side, k, value(e)); err != nil {
-					return err
-				}
+			w.streaming, w.unbound = false, false
+			if err = e.finish(w.maxMatch); err != nil {
+				break
+			}
+			if h.Side == record.Right {
+				// Left records sort first: this key has none.
+				err = w.single(src, h, key)
+				break
+			}
+			if err = e.start(h.Hash, key, w.f[reconv1.JoinState_JOIN_STATE_BOTH] || w.f[reconv1.JoinState_JOIN_STATE_LEFT_ONLY]); err == nil {
+				err = e.add(h.Side, h.ValLen, src)
 			}
 		}
-		i = end
-	}
-	return nil
-}
-
-// emitEmpty streams the records of parts' empty-key partitions, left then
-// right, as one-sided results in ingest order. Their files are read one
-// buffer at a time, so the partitions needn't fit in memory, however many
-// records they hold.
-func (j *joiner) emitEmpty(parts *buffer.Partitions) error {
-	bufs := []sided{{parts.Empty(buffer.Left), buffer.Left}, {parts.Empty(buffer.Right), buffer.Right}}
-	read := j.readSize()
-	pins, reserved, err := j.pinFor(bufs, 0, read)
-	if err != nil {
-		return err
-	}
-	defer unpin(pins)
-	defer j.pool.Release(reserved)
-	err = j.each(pins, read, func(c chunk) error {
-		for off := 0; off < len(c.data); {
-			_, k, v, next := buffer.Decode(c.data, off)
-			off = next
-			j.counts[c.side]++
-			if !c.streamed || !j.f.oneSided(c.side) {
-				if err := j.out.oneSided(j.f, c.side, k, v); err != nil {
-					return err
-				}
-				continue
-			}
-			// The batch outlives the read buffer, so it holds clones, which
-			// the output batch's reservation covers up to its limit. A
-			// record larger than that would be sent in a batch of its own
-			// anyway: it is sent straight from the read buffer, which holds
-			// it in reserved memory, before the buffer is reused.
-			alone := int64(len(k)+len(v)) > j.out.limit
-			if !alone {
-				k, v = bytes.Clone(k), bytes.Clone(v)
-			}
-			if err := j.out.oneSided(j.f, c.side, k, v); err != nil {
-				return err
-			}
-			if alone {
-				if err := j.out.flush(); err != nil {
-					return err
-				}
-			}
+		if err != nil {
+			return err
 		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	return j.out.flush()
-}
-
-// batcher collects a worker's results into JoinResponses of about limit
-// bytes, which it hands to the sender.
-type batcher struct {
-	ctx   context.Context // of the worker's task
-	sends chan<- sendRequest
-	sent  chan error // the sender's reply
-	limit int64
-	batch []*reconv1.JoinResult
-	size  int64
-}
-
-// sendRequest asks the sender to send resp, and to reply on sent with the
-// send's error.
-type sendRequest struct {
-	resp *reconv1.JoinResponse
-	sent chan<- error
-}
-
-func (b *batcher) oneSided(f Filter, side buffer.Side, key, value []byte) error {
-	if !f.oneSided(side) {
-		return nil
-	}
-	rec := &reconv1.Record{Key: key, Value: value}
-	if side == buffer.Left {
-		return b.add(&reconv1.JoinResult{Result: &reconv1.JoinResult_LeftOnly{LeftOnly: rec}})
-	}
-	return b.add(&reconv1.JoinResult{Result: &reconv1.JoinResult_RightOnly{RightOnly: rec}})
-}
-
-// add adds r to the batch, first sending the batch if r would take it past
-// the limit.
-func (b *batcher) add(r *reconv1.JoinResult) error {
-	n := proto.Size(r)
-	size := int64(protowire.SizeTag(1) + protowire.SizeBytes(n))
-	if len(b.batch) > 0 && b.size+size > b.limit {
-		if err := b.flush(); err != nil {
+		w.counts[h.Side]++
+		if err := m.Pop(); err != nil {
 			return err
 		}
 	}
-	b.batch = append(b.batch, r)
-	b.size += size
-	return nil
+	w.streaming = false
+	if err := e.finish(w.maxMatch); err != nil {
+		return err
+	}
+	return e.flush()
 }
 
-// flush sends the batch, if it holds any results, once ctx is checked, and
-// returns once it is sent.
-func (b *batcher) flush() error {
-	if err := b.ctx.Err(); err != nil {
-		return context.Cause(b.ctx)
-	}
-	if len(b.batch) == 0 {
+// single emits the head of src as a one-sided result, if the filter
+// returns it.
+func (w *worker) single(src merge.Source, h record.Header, key []byte) error {
+	if !w.f.oneSided(h.Side) {
 		return nil
 	}
-	resp := &reconv1.JoinResponse{Results: b.batch}
-	b.batch, b.size = nil, 0
-	select {
-	case b.sends <- sendRequest{resp, b.sent}:
-	case <-b.ctx.Done():
-		return context.Cause(b.ctx)
+	e := w.e
+	if err := e.start(h.Hash, key, true); err != nil {
+		return err
 	}
-	return <-b.sent
+	if err := e.add(h.Side, h.ValLen, src); err != nil {
+		return err
+	}
+	return e.finish(w.maxMatch)
+}
+
+// overflow handles a key whose values held no longer fit a Match, or the
+// memory a worker holds one in, when the head of the merge is one more
+// record of it. It scans the rest of the key without keeping it, and goes
+// back to where the scan began. If the key has right records and its Match
+// is larger than the maximum, the Join fails with a HotKeyError; if its
+// Match is within the maximum, its many small values are held on, as far
+// as the pool allows. If it has only left ones, they are left_only
+// results, however many: the ones held are emitted, and the rest are
+// streamed.
+func (w *worker) overflow() error {
+	m, e := w.m, w.e
+	key := e.key() // in the arena, which the scan doesn't touch
+	left, right, size := e.nl, e.nr, e.gsize
+	for i, s := range m.Sources() {
+		w.save[i] = s.Pos()
+	}
+	for n := 1; ; n++ {
+		src := m.Top()
+		if src == nil {
+			break
+		}
+		head := src.Head()
+		h, _ := record.ParseHeader(head)
+		if h.Hash != e.ghash || !bytes.Equal(head[h.Len:h.Len+h.KeyLen], key) {
+			break
+		}
+		if h.Side == record.Left {
+			left++
+		} else {
+			right++
+		}
+		size += bytesField(h.ValLen)
+		if n&4095 == 0 && w.ctx.Err() != nil {
+			return context.Cause(w.ctx)
+		}
+		if err := m.Pop(); err != nil {
+			return err
+		}
+	}
+	rewind := func() error {
+		for i, s := range m.Sources() {
+			if err := s.Rewind(w.save[i]); err != nil {
+				return err
+			}
+		}
+		m.Init()
+		return nil
+	}
+	switch {
+	case right > 0 && size > w.maxMatch:
+		return hotKey(key, left, right, size, w.maxMatch)
+	case right > 0:
+		w.unbound = true
+		return rewind()
+	}
+	if cap(w.skey) < len(key) {
+		if err := e.reserve(int64(len(key))); err != nil {
+			return err
+		}
+		w.skey = make([]byte, 0, len(key))
+	}
+	w.skey = append(w.skey[:0], key...)
+	w.shash, w.streaming = e.ghash, true
+	w.streamed++
+	if err := e.finish(w.maxMatch); err != nil {
+		return err
+	}
+	return rewind()
 }

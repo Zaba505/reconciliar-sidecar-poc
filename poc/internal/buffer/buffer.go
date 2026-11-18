@@ -1,316 +1,378 @@
-// Package buffer holds a run's ingested records in memory, one Buffer per
-// (side, bucket) plus one per side for empty keys (§8.1).
+// Package buffer holds a run's records: in memory, in blocks, until the
+// pool needs the room, and then in the sorted run files they were spilled
+// to (§8.1, §8.3).
 //
-// A Buffer is a list of byte chunks holding records already in spill-file
-// encoding:
+// Records arrive in any order, on any number of Ingest streams, and are
+// copied once into fixed-size blocks: the records grow from the front of a
+// block, a 16-byte entry {hash, offset, ticket} per record from its back.
+// The goroutine that fills a block sorts its entries, by (hash, key, side,
+// ticket), and never the records. Nothing is partitioned, indexed or
+// looked up by key.
 //
-//	hash u64 (little endian) | uvarint key len | uvarint value len | key | value
+// A spill takes every block of the run, merges their sorted entries, and
+// writes the records in that order to ONE new run file: so a run is a few
+// large sorted files, one per spill, whatever the data's size or keys.
 //
-// A record never spans two chunks. Chunks start at 4 KiB and double up to
-// 1 MiB, so a run with thousands of small buckets doesn't reserve a large
-// chunk for each one before its records arrive. Each chunk reserves its
-// capacity from the mem.Pool. A spill writes a buffer's chunks to a file
-// unchanged.
+// The ticket of a record is that of the Append section that wrote it: the
+// records a stream appended before another section began have a smaller
+// ticket. Every record in a run file was appended before every record in
+// a later one, so records of one key and side keep their ingest order in a
+// merge that orders files by their place in the run, and blocks after
+// them.
 package buffer
 
 import (
-	"encoding/binary"
 	"errors"
 	"slices"
 	"sync"
-
-	"github.com/zeebo/xxh3"
+	"sync/atomic"
 
 	"poc/internal/mem"
+	"poc/internal/merge"
+	"poc/internal/record"
 	"poc/internal/spill"
 )
 
-// Side is the side of a run a record belongs to.
-type Side uint8
-
-const (
-	Left Side = iota
-	Right
-)
-
-func (s Side) String() string {
-	if s == Left {
-		return "left"
-	}
-	return "right"
-}
-
-// Seed is the XXH3 seed records are partitioned with. Runs don't survive a
-// restart, so it may change between versions.
-const Seed uint64 = 0x5265636f6e53640a
-
-// Hash returns the hash a non-empty key is partitioned by.
-func Hash(key []byte) uint64 {
-	return xxh3.HashSeed(key, Seed)
-}
-
-const (
-	minChunk = 4 << 10
-	maxChunk = 1 << 20
-)
-
-// ErrFreed is returned by Append on a Buffer that was freed, because its
-// run was deleted.
+// ErrFreed is returned by Append once the buffer is freed, because its run
+// was deleted.
 var ErrFreed = errors.New("buffer freed")
 
-// EncodedLen returns the size of a record's encoding.
-func EncodedLen(key, value []byte) int {
-	return 8 + uvarintLen(len(key)) + uvarintLen(len(value)) + len(key) + len(value)
+// ErrSealed is returned by Append once the buffer is sealed.
+var ErrSealed = errors.New("buffer sealed")
+
+// errTickets is returned by Append once a run has taken 2^32-1 sections.
+var errTickets = errors.New("the run took too many ingest messages")
+
+// BlockSize returns the size of the blocks of a pool of limit bytes: 1 MiB,
+// or a thirty-second of a small budget, so that spilling always makes room
+// for a block.
+func BlockSize(limit int64) int {
+	return int(max(4<<10, min(1<<20, limit/32))) &^ 15
 }
 
-func uvarintLen(n int) int {
-	l := 1
-	for n >= 0x80 {
-		n >>= 7
-		l++
-	}
-	return l
-}
-
-// AppendRecord appends the encoding of a record to dst.
-func AppendRecord(dst []byte, hash uint64, key, value []byte) []byte {
-	dst = binary.LittleEndian.AppendUint64(dst, hash)
-	dst = binary.AppendUvarint(dst, uint64(len(key)))
-	dst = binary.AppendUvarint(dst, uint64(len(value)))
-	dst = append(dst, key...)
-	return append(dst, value...)
-}
-
-// MaxHeader is the most bytes a record's hash and lengths take.
-const MaxHeader = 8 + 2*binary.MaxVarintLen64
-
-// RecordLen returns the length of the record encoded at the start of b, or
-// false if b doesn't hold its hash and lengths. With MaxHeader bytes or
-// more, false means they are corrupt.
-func RecordLen(b []byte) (int, bool) {
-	if len(b) < 8 {
-		return 0, false
-	}
-	kl, n := binary.Uvarint(b[8:])
-	if n <= 0 {
-		return 0, false
-	}
-	vl, m := binary.Uvarint(b[8+n:])
-	if m <= 0 {
-		return 0, false
-	}
-	return 8 + n + m + int(kl) + int(vl), true
-}
-
-// Decode decodes the record at b[off:] and returns the offset of the next
-// one. The key and value alias b, and are capped so that appending to them
-// copies. b must hold complete records, as chunks do.
-func Decode(b []byte, off int) (hash uint64, key, value []byte, next int) {
-	hash = binary.LittleEndian.Uint64(b[off:])
-	off += 8
-	kl, n := binary.Uvarint(b[off:])
-	off += n
-	vl, n := binary.Uvarint(b[off:])
-	off += n
-	k := off + int(kl)
-	v := k + int(vl)
-	return hash, b[off:k:k], b[k:v:v], v
-}
-
-// Buffer is the records of one (side, bucket). It is safe for concurrent
-// use.
-//
-// Its records are in its spill files, in the order of the manifest, then in
-// its chunks: together, in ingest order. A spill writes every chunk to one
-// new file. A pinned buffer, which a join is reading, isn't spilled.
+// Buffer is a run's records. It is safe for concurrent use.
 type Buffer struct {
-	mu       sync.Mutex
-	chunks   [][]byte
-	next     int   // capacity of the next chunk
-	reserved int64 // capacity of chunks, reserved from the pool
-	records  int64 // in chunks and files
-	bytes    int64 // encoded bytes, in chunks and files
-	freed    bool
+	pool      *mem.Pool
+	blockSize int
 
-	memRecords int64 // in chunks
-	files      []spill.File
-	seq        int           // of the next spill file
-	pins       int           // of joins reading the buffer
-	spilling   chan struct{} // closed once the spill in progress ends
+	// mu is held for reading by an Append section while it fills a block,
+	// and for writing to take the blocks, so that a spill sees no record
+	// half written, and every record appended before it is in its file or
+	// an earlier one.
+	mu     sync.RWMutex
+	lmu    sync.Mutex // guards open and full
+	open   []*block   // partly filled, each taken by one section at a time
+	full   []*block   // sorted
+	ticket atomic.Uint32
+
+	// spillMu is held while a spill writes, so that Pin and Free wait for
+	// its file.
+	spillMu sync.Mutex
+
+	files  []*spill.File // guarded by mu
+	meta   int64         // reserved for files, guarded by mu
+	pins   int           // of Joins reading the blocks, guarded by mu
+	sealed bool          // guarded by mu
+	freed  bool          // guarded by mu
 }
 
-// maxChunkOf returns the largest chunk a buffer reserves from pool, short of
-// a record that needs more: 1 MiB, or a sixteenth of a small budget, so that
-// a chunk always fits in the room spilling makes.
-func maxChunkOf(pool *mem.Pool) int {
-	return int(max(minChunk, min(maxChunk, pool.Limit()/16)))
+// New returns an empty Buffer whose blocks reserve their memory from pool.
+func New(pool *mem.Pool) *Buffer {
+	b := &Buffer{pool: pool, blockSize: BlockSize(pool.Limit())}
+	if int64(b.blockSize)+blockOverhead < spill.FileBytes {
+		panic("buffer: a block holds less than a File")
+	}
+	return b
 }
 
-// Append encodes a record into the buffer, reserving a new chunk from pool
-// when the last one is full. It fails with the error of pool.Reserve when
-// the pool can't cover the chunk, and with ErrFreed once the buffer is
-// freed.
-func (b *Buffer) Append(pool *mem.Pool, hash uint64, key, value []byte) error {
-	n := EncodedLen(key, value)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	var spare int64 // a chunk reserved from the pool but not yet added
-	for {
+// Append copies n records of side into blocks: rec(i) returns the key and
+// value of the i-th, which aren't kept. It reserves new blocks from the
+// pool, which may spill this buffer or another, and fails with the error
+// of the reservation. It returns how many records it copied: those it
+// copied before it failed are kept.
+func (b *Buffer) Append(side record.Side, n int, rec func(i int) (key, value []byte)) (int, error) {
+	var spare *block // reserved, not in a list
+	defer func() {
+		if spare != nil {
+			b.drop(spare)
+		}
+	}()
+	for i := 0; i < n; {
+		b.mu.RLock()
 		switch {
 		case b.freed:
-			if spare > 0 {
-				pool.Release(spare)
+			b.mu.RUnlock()
+			return i, ErrFreed
+		case b.sealed:
+			b.mu.RUnlock()
+			return i, ErrSealed
+		}
+		blk := spare
+		spare = nil
+		if blk == nil {
+			blk = b.popOpen()
+		}
+		if blk != nil {
+			// The ticket orders this section's records after those of every
+			// section that ended before it began.
+			ticket := b.ticket.Add(1)
+			if ticket == 0 {
+				b.ticket.Store(^uint32(0))
+				b.pushOpen(blk)
+				b.mu.RUnlock()
+				return i, errTickets
 			}
-			return ErrFreed
-		case len(b.chunks) > 0 && cap(b.chunks[len(b.chunks)-1])-len(b.chunks[len(b.chunks)-1]) >= n:
-			last := &b.chunks[len(b.chunks)-1]
-			*last = AppendRecord(*last, hash, key, value)
-			b.records++
-			b.memRecords++
-			b.bytes += int64(n)
-			if spare > 0 {
-				pool.Release(spare)
+			for i < n {
+				k, v := rec(i)
+				if !blk.append(side, k, v, ticket) {
+					break
+				}
+				i++
 			}
-			return nil
-		case spare > 0:
-			b.chunks = append(b.chunks, make([]byte, 0, spare))
-			b.reserved += spare
-			b.next = min(max(b.next, minChunk)*2, maxChunkOf(pool))
-			spare = 0
-		default:
-			size := int64(max(min(max(b.next, minChunk), maxChunkOf(pool)), n))
-			// The pool isn't reserved under the buffer's lock, so a
-			// reservation never holds up the buffer's other writers, and it
-			// may spill this buffer. Another writer may add a chunk
-			// meanwhile, which the loop then fills first.
-			b.mu.Unlock()
-			err := pool.Reserve(size)
-			b.mu.Lock()
-			if err != nil {
-				return err
+			switch {
+			case i == n:
+				b.pushOpen(blk)
+			case blk.ne > 0:
+				blk.sort()
+				b.lmu.Lock()
+				b.full = append(b.full, blk)
+				b.lmu.Unlock()
+			default:
+				// An empty block too small for the record: only a block of
+				// the record's size holds it.
+				spare = blk
 			}
-			spare = size
+		}
+		b.mu.RUnlock()
+		if i == n {
+			return n, nil
+		}
+
+		k, v := rec(i)
+		need := record.Len(len(k), len(v))
+		if spare != nil {
+			if fits(need, len(spare.buf)) {
+				continue
+			}
+			b.drop(spare)
+			spare = nil
+		}
+		// Reserving may spill, which takes mu for writing: never reserve
+		// inside a section.
+		var err error
+		if spare, err = b.newBlock(max(b.blockSize, (need+entrySize+15)&^15)); err != nil {
+			return i, err
 		}
 	}
+	return n, nil
 }
 
-// AddFile adds a spill file to the manifest of a buffer that has no
-// chunks, after its other files. It is how a join builds the buffers of a
-// sub-partitioned bucket.
-func (b *Buffer) AddFile(f spill.File) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.chunks) > 0 {
-		panic("buffer: AddFile to a buffer with chunks")
+func (b *Buffer) popOpen() *block {
+	b.lmu.Lock()
+	defer b.lmu.Unlock()
+	if n := len(b.open); n > 0 {
+		blk := b.open[n-1]
+		b.open = b.open[:n-1]
+		return blk
 	}
-	b.files = append(b.files, f)
-	b.records += f.Records
-	b.bytes += f.Bytes
-	b.seq++
-}
-
-// Chunks returns the buffer's in-memory chunks. They must not be modified,
-// and stay valid after the buffer is freed or spilled.
-func (b *Buffer) Chunks() [][]byte {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([][]byte(nil), b.chunks...)
-}
-
-// Records returns the number of records in the buffer, in memory and in
-// files.
-func (b *Buffer) Records() int64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.records
-}
-
-// Bytes returns the size of the buffer's encoded records, in memory and in
-// files.
-func (b *Buffer) Bytes() int64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.bytes
-}
-
-// Files returns the buffer's spill files.
-func (b *Buffer) Files() []spill.File {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return slices.Clone(b.files)
-}
-
-// lockIdle locks b.mu once no spill of the buffer is in progress.
-func (b *Buffer) lockIdle() {
-	for {
-		b.mu.Lock()
-		done := b.spilling
-		if done == nil {
-			return
-		}
-		b.mu.Unlock()
-		<-done
-	}
-}
-
-// SpillSize returns the memory a spill would release now: 0 while the
-// buffer is pinned, freed or being spilled.
-func (b *Buffer) SpillSize() int64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.pins > 0 || b.freed || b.spilling != nil {
-		return 0
-	}
-	return b.reserved
-}
-
-// Spill writes the buffer's chunks with write, as the file numbered seq,
-// and releases their memory to pool. While write runs the buffer takes
-// new records into new chunks. If write fails, the chunks stay in memory.
-// A pinned, freed or empty buffer isn't spilled.
-func (b *Buffer) Spill(pool *mem.Pool, write func(seq int, records int64, chunks [][]byte) (spill.File, error)) error {
-	b.lockIdle()
-	if b.pins > 0 || b.freed || len(b.chunks) == 0 {
-		b.mu.Unlock()
-		return nil
-	}
-	chunks, records, seq := b.chunks, b.memRecords, b.seq
-	b.chunks, b.memRecords, b.next = nil, 0, 0
-	done := make(chan struct{})
-	b.spilling = done
-	b.mu.Unlock()
-
-	f, err := write(seq, records, chunks)
-
-	b.mu.Lock()
-	b.spilling = nil
-	close(done)
-	if err != nil {
-		b.chunks = append(chunks, b.chunks...)
-		b.memRecords += records
-		b.mu.Unlock()
-		return err
-	}
-	var released int64
-	for _, c := range chunks {
-		released += int64(cap(c))
-	}
-	b.files = append(b.files, f)
-	b.seq++
-	b.reserved -= released
-	b.mu.Unlock()
-	pool.Release(released)
 	return nil
 }
 
-// Pin keeps the buffer in memory until Unpin, and returns its records:
-// its files, then its chunks, in ingest order. It waits for a spill in
-// progress to end.
-func (b *Buffer) Pin() (files []spill.File, chunks [][]byte) {
-	b.lockIdle()
+func (b *Buffer) pushOpen(blk *block) {
+	b.lmu.Lock()
+	b.open = append(b.open, blk)
+	b.lmu.Unlock()
+}
+
+// newBlock returns an empty block of size bytes, reserved: an idle one of
+// the pool's, or a new one.
+func (b *Buffer) newBlock(size int) (*block, error) {
+	if size == b.blockSize {
+		if buf, reserved := b.pool.TakeIdle(size); buf != nil {
+			if reserved != int64(size)+blockOverhead {
+				// Not a block of this package's: keep the reservation right.
+				b.pool.Release(reserved)
+				if err := b.pool.Reserve(int64(size) + blockOverhead); err != nil {
+					return nil, err
+				}
+			}
+			return &block{buf: buf}, nil
+		}
+	}
+	if err := b.pool.Reserve(int64(size) + blockOverhead); err != nil {
+		return nil, err
+	}
+	return &block{buf: make([]byte, size)}, nil
+}
+
+// drop gives back a block nothing refers to any more: to the pool's idle
+// buffers if it is of the usual size, else to the garbage collector.
+func (b *Buffer) drop(blk *block) {
+	if len(blk.buf) == b.blockSize {
+		b.pool.PutIdle(blk.buf, blk.reserved())
+	} else {
+		b.pool.Release(blk.reserved())
+	}
+	blk.buf = nil
+}
+
+// SpillSize returns the memory a spill would release now: the blocks',
+// unless a Join reads them or the buffer is freed.
+func (b *Buffer) SpillSize() int64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.pins > 0 || b.freed {
+		return 0
+	}
+	b.lmu.Lock()
+	defer b.lmu.Unlock()
+	var n int64
+	for _, blk := range b.open {
+		n += blk.reserved()
+	}
+	for _, blk := range b.full {
+		n += blk.reserved()
+	}
+	return n
+}
+
+// WriteFunc writes the records of m, bytes bytes of them, as a new run
+// file, and returns it.
+type WriteFunc func(bytes int64, m *merge.Merger) (*spill.File, error)
+
+// Spill merges every block into one run file, which write writes, and
+// gives back the blocks. While write runs, Appends go on into new blocks,
+// as far as the pool lets them. If write fails, the records stay in
+// memory. A pinned, freed or empty buffer isn't
+// spilled.
+//
+// The new file's memory is taken from the blocks', since Spill runs inside
+// the pool's Reserve, where it can't reserve.
+func (b *Buffer) Spill(write WriteFunc) error {
+	b.spillMu.Lock()
+	defer b.spillMu.Unlock()
+
+	b.mu.Lock()
+	if b.pins > 0 || b.freed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.lmu.Lock()
+	blocks := append(b.full, b.open...)
+	b.full, b.open = nil, nil
+	b.lmu.Unlock()
+	b.mu.Unlock()
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	var bytes int64
+	srcs := make([]merge.Source, len(blocks))
+	for i, blk := range blocks {
+		blk.sort()
+		bytes += int64(blk.n)
+		srcs[i] = &source{buf: blk.buf, ents: blk.ents()}
+	}
+	m := merge.New(srcs)
+	m.Init()
+	f, err := write(bytes, m)
+	if err != nil {
+		b.mu.Lock()
+		b.lmu.Lock()
+		b.full = append(blocks, b.full...)
+		b.lmu.Unlock()
+		b.mu.Unlock()
+		return err
+	}
+
+	b.mu.Lock()
+	b.files = append(b.files, f)
+	b.meta += spill.FileBytes
+	b.mu.Unlock()
+	first := blocks[0]
+	b.pool.Release(first.reserved() - spill.FileBytes)
+	first.buf = nil
+	for _, blk := range blocks[1:] {
+		b.drop(blk)
+	}
+	return nil
+}
+
+// Seal ends the buffer's Appends, once a spill in progress ends. The
+// blocks still in memory are sorted, and stay there; it reports whether the buffer has spilled, in which case
+// the caller spills them too, so that a Join reads only files.
+func (b *Buffer) Seal() (spilled bool, err error) {
+	b.spillMu.Lock()
+	defer b.spillMu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.freed {
+		return false, ErrFreed
+	}
+	b.sealed = true
+	b.lmu.Lock()
+	defer b.lmu.Unlock()
+	for _, blk := range b.open {
+		if blk.ne > 0 {
+			blk.sort()
+			b.full = append(b.full, blk)
+		} else {
+			b.drop(blk)
+		}
+	}
+	b.open = nil
+	return len(b.files) > 0, nil
+}
+
+// Unseal undoes a Seal whose run failed to seal, so that Appends go on.
+func (b *Buffer) Unseal() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.sealed = false
+}
+
+// Files returns the buffer's run files, in the order they were written.
+func (b *Buffer) Files() []*spill.File {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return slices.Clone(b.files)
+}
+
+// Replace replaces files lo to hi-1 with f, which holds their records,
+// once a merge wrote it, and releases the memory the files took.
+func (b *Buffer) Replace(lo, hi int, f *spill.File) {
+	b.spillMu.Lock()
+	defer b.spillMu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.files = slices.Replace(b.files, lo, hi, f)
+	freed := int64(hi-lo-1) * spill.FileBytes
+	b.meta -= freed
+	b.pool.Release(freed)
+}
+
+// Snapshot is a pinned buffer's records: its run files, and its blocks,
+// whose records were all appended after the files'.
+type Snapshot struct {
+	Files  []*spill.File
+	blocks []*block
+}
+
+// Pin keeps the buffer's blocks in memory until Unpin, and returns them
+// with the files. It waits for a spill in progress to end. Only a sealed
+// buffer is pinned, so its blocks are all sorted.
+func (b *Buffer) Pin() *Snapshot {
+	b.spillMu.Lock()
+	defer b.spillMu.Unlock()
+	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pins++
-	return slices.Clone(b.files), slices.Clone(b.chunks)
+	b.lmu.Lock()
+	defer b.lmu.Unlock()
+	if len(b.open) > 0 {
+		panic("buffer: Pin of a buffer that isn't sealed")
+	}
+	return &Snapshot{Files: slices.Clone(b.files), blocks: slices.Clone(b.full)}
 }
 
 // Unpin undoes a Pin.
@@ -320,59 +382,49 @@ func (b *Buffer) Unpin() {
 	b.pins--
 }
 
-// Free drops the buffer's chunks and releases their reservation. Later
-// Appends fail with ErrFreed. It waits for a spill in progress to end.
-func (b *Buffer) Free(pool *mem.Pool) {
-	b.lockIdle()
+// Free drops the buffer's blocks and releases the memory it holds. Later
+// Appends fail with ErrFreed. It waits for a spill in progress to end. The
+// files are the caller's to remove.
+func (b *Buffer) Free() {
+	b.spillMu.Lock()
+	defer b.spillMu.Unlock()
+	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.freed {
 		return
 	}
-	pool.Release(b.reserved)
-	b.chunks, b.reserved, b.freed = nil, 0, true
-}
-
-// Partitions is a run's buffers: N buckets per side for non-empty keys,
-// and one empty-key partition per side.
-type Partitions struct {
-	buckets [2][]Buffer
-	empty   [2]Buffer
-}
-
-// NewPartitions returns empty Partitions with n buckets per side.
-func NewPartitions(n uint32) *Partitions {
-	p := &Partitions{}
-	for s := range p.buckets {
-		p.buckets[s] = make([]Buffer, n)
+	b.freed = true
+	b.lmu.Lock()
+	for _, blk := range b.open {
+		b.drop(blk)
 	}
-	return p
-}
-
-// Buckets returns the number of buckets per side.
-func (p *Partitions) Buckets() uint32 { return uint32(len(p.buckets[Left])) }
-
-// Bucket returns the buffer of side's bucket i.
-func (p *Partitions) Bucket(side Side, i uint32) *Buffer { return &p.buckets[side][i] }
-
-// Empty returns side's empty-key partition.
-func (p *Partitions) Empty(side Side) *Buffer { return &p.empty[side] }
-
-// Append adds a record to side: an empty key to the empty-key partition,
-// unhashed, and any other key to bucket Hash(key) mod N.
-func (p *Partitions) Append(pool *mem.Pool, side Side, key, value []byte) error {
-	if len(key) == 0 {
-		return p.empty[side].Append(pool, 0, key, value)
+	for _, blk := range b.full {
+		b.drop(blk)
 	}
-	h := Hash(key)
-	return p.buckets[side][h%uint64(len(p.buckets[side]))].Append(pool, h, key, value)
+	b.open, b.full = nil, nil
+	b.lmu.Unlock()
+	b.pool.Release(b.meta)
+	b.meta, b.files = 0, nil
 }
 
-// Free frees every buffer.
-func (p *Partitions) Free(pool *mem.Pool) {
-	for s := range p.buckets {
-		for i := range p.buckets[s] {
-			p.buckets[s][i].Free(pool)
+// Blocks returns the number of blocks in the snapshot.
+func (s *Snapshot) Blocks() int { return len(s.blocks) }
+
+// AddFenceBytes adds the bytes of the records of each fence in the
+// snapshot's blocks to sizes.
+func (s *Snapshot) AddFenceBytes(sizes *[record.Fences]int64) {
+	for _, blk := range s.blocks {
+		for _, e := range blk.ents() {
+			n, _ := record.Size(blk.buf[e.off:])
+			sizes[record.Fence(e.hash)] += int64(n)
 		}
-		p.empty[s].Free(pool)
 	}
+}
+
+// Source returns a merge.Source of the records of fences lo to hi-1 in
+// block i, whose ords are base plus their tickets. base must be above the
+// ords of every file's records.
+func (s *Snapshot) Source(i, lo, hi int, base uint64) merge.Source {
+	blk := s.blocks[i]
+	return &source{buf: blk.buf, ents: blk.fenceRange(lo, hi), base: base}
 }

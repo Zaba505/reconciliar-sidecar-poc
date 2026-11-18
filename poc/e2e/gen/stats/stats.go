@@ -2,12 +2,13 @@
 // sidecar's spill format, so that generated values can be calibrated
 // against real ones.
 //
-// Sample encodes records as the sidecar's buffers hold them, keeping each
-// side's records in a stream of their own as the sidecar spills each side
-// separately. It packs each stream into blocks of whole records of at most
-// 64 KiB, and compresses every block on its own with s2 and with zstd
-// level 1. That is how the generator's reference prototype measured its
-// profiles, so the ratios compare with its results.
+// Sample encodes records as the sidecar's blocks and run files hold them,
+// keeping each side's records in a stream of their own, in arrival order.
+// It packs each stream into blocks of whole records of at most 64 KiB, and
+// compresses every block on its own with s2 and with zstd level 1. That is
+// how the generator's reference prototype measured its profiles, so the
+// ratios compare with its results; the sidecar's run files mix the sides
+// in hash order, which compresses about as well for values this random.
 package stats
 
 import (
@@ -18,7 +19,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 
 	"poc/e2e/harness"
-	"poc/internal/buffer"
+	"poc/internal/record"
 )
 
 // blockSize is the most bytes of records Sample compresses at once. A
@@ -86,24 +87,20 @@ func newSampler() *sampler {
 	return &sampler{zstd: z}
 }
 
-// add appends one record to its side's block, as the sidecar's buffers
-// encode it: hashed with buffer.Hash, or with hash 0 for an empty key. A
-// record that would overflow a non-empty block starts a new one.
+// add appends one record to its side's block, as the sidecar encodes it:
+// hashed with record.Hash, which is 0 for an empty key. A record that would
+// overflow a non-empty block starts a new one.
 func (s *sampler) add(rec harness.Record) {
-	var hash uint64
-	if len(rec.Key) > 0 {
-		hash = buffer.Hash(rec.Key)
-	}
-	b := &s.blocks[0]
+	b, side := &s.blocks[0], record.Left
 	if rec.Side != harness.Left {
-		b = &s.blocks[1]
+		b, side = &s.blocks[1], record.Right
 	}
-	n := buffer.EncodedLen(rec.Key, rec.Value)
+	n := record.Len(len(rec.Key), len(rec.Value))
 	if len(*b) > 0 && len(*b)+n > blockSize {
 		s.compress(*b)
 		*b = (*b)[:0]
 	}
-	*b = buffer.AppendRecord(*b, hash, rec.Key, rec.Value)
+	*b = record.Append(*b, record.Hash(rec.Key), side, rec.Key, rec.Value)
 
 	s.r.Records++
 	s.r.KeyBytes += int64(len(rec.Key))

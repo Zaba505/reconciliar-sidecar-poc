@@ -69,3 +69,14 @@ func TestFilter(t *testing.T) {
 		t.Error("an empty filter must keep every result")
 	}
 }
+
+func TestDiffOrdered_sees_value_order(t *testing.T) {
+	ab := []*reconv1.JoinResult{{Result: &reconv1.JoinResult_Both{Both: &reconv1.Match{Key: []byte("k"), Left: [][]byte{[]byte("a"), []byte("b")}, Right: [][]byte{nil}}}}}
+	ba := []*reconv1.JoinResult{{Result: &reconv1.JoinResult_Both{Both: &reconv1.Match{Key: []byte("k"), Left: [][]byte{[]byte("b"), []byte("a")}, Right: [][]byte{nil}}}}}
+	if d := Diff(ab, ba); d != "" {
+		t.Errorf("Diff sees value order: %s", d)
+	}
+	if d := DiffOrdered(ab, ba); d == "" {
+		t.Error("DiffOrdered doesn't see value order")
+	}
+}

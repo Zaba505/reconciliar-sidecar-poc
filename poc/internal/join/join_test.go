@@ -2,14 +2,19 @@ package join
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/z5labs/humus"
 	"github.com/z5labs/humus/humustest"
 	"google.golang.org/protobuf/proto"
 	"pgregory.net/rapid"
@@ -17,145 +22,131 @@ import (
 	reconv1 "poc/gen/recon/v1"
 	"poc/internal/buffer"
 	"poc/internal/mem"
+	"poc/internal/merge"
 	"poc/internal/oracle"
+	"poc/internal/record"
 	"poc/internal/spill"
 )
 
-// load appends records to new Partitions with n buckets and returns them
-// with their per-side totals.
-func load(t interface {
-	Helper()
-	Fatal(...any)
-}, pool *mem.Pool, n uint32, records []oracle.Record) (*buffer.Partitions, [2]uint64) {
+// env is a run's buffer, spilled to real files, below run.Manager.
+type env struct {
+	fsys  humus.FS
+	dir   string
+	pool  *mem.Pool
+	buf   *buffer.Buffer
+	wbuf  []byte
+	seq   atomic.Int64
+	disk  atomic.Int64 // bytes of files
+	recs  []oracle.Record
+	spill atomic.Bool // the pool may spill the buffer
+}
+
+var hostOnce struct {
+	sync.Mutex
+	n int
+}
+
+func newEnv(t testing.TB, limit int64) *env {
 	t.Helper()
-	p := buffer.NewPartitions(n)
-	var totals [2]uint64
-	for _, r := range records {
-		if err := p.Append(pool, buffer.Side(r.Side), r.Key, r.Value); err != nil {
-			t.Fatal(err)
-		}
-		totals[r.Side]++
+	h := humustest.NewHost(t, humustest.WithFiles(map[string][]byte{"data/.keep": nil}))
+	return newEnvOn(h.FS(), h.Path("data"), limit)
+}
+
+func newEnvOn(fsys humus.FS, dir string, limit int64) *env {
+	pool := mem.NewPool(limit)
+	e := &env{fsys: fsys, dir: dir, pool: pool, buf: buffer.New(pool), wbuf: spill.AlignedBuffer(buffer.BlockSize(limit) &^ (spill.Align - 1))}
+	e.spill.Store(true)
+	pool.SetSource(func() []mem.Spillable { return []mem.Spillable{(*envSpill)(e)} })
+	return e
+}
+
+type envSpill env
+
+func (s *envSpill) SpillSize() int64 {
+	if !s.spill.Load() {
+		return 0
 	}
-	return p, totals
+	return s.buf.SpillSize()
 }
+func (s *envSpill) Spill() error { return s.buf.Spill((*env)(s).write) }
 
-// collect runs a join and returns its batches.
-func collect(ctx context.Context, pool *mem.Pool, disk *spill.Disk, p *buffer.Partitions, opts Options) ([]*reconv1.JoinResponse, error) {
-	var batches []*reconv1.JoinResponse
-	_, err := Run(ctx, pool, disk, p, opts, func(r *reconv1.JoinResponse) error {
-		batches = append(batches, proto.Clone(r).(*reconv1.JoinResponse))
-		return nil
-	})
-	return batches, err
-}
-
-// spiller writes spill files into a temporary directory.
-type spiller struct {
-	disk *spill.Disk
-	dir  string
-	n    int
-}
-
-func newSpiller(t testing.TB) *spiller {
-	h := humustest.NewHost(t, humustest.WithFiles(map[string][]byte{"spill/.keep": nil}))
-	return &spiller{disk: spill.NewDisk(h.FS(), 1<<30), dir: h.Path("spill")}
-}
-
-// spill spills b to the spiller's directory.
-func (s *spiller) spill(pool *mem.Pool, b *buffer.Buffer) error {
-	s.n++
-	dir := filepath.Join(s.dir, fmt.Sprint(s.n))
-	return b.Spill(pool, func(seq int, records int64, chunks [][]byte) (spill.File, error) {
-		return s.disk.Write(filepath.Join(dir, fmt.Sprintf("%d.rec", seq)), records, chunks)
-	})
-}
-
-// Write and Remove make the spiller the Scratch of a join, under its
-// directory's scratch/.
-func (s *spiller) Write(path string, records int64, chunks [][]byte) (spill.File, error) {
-	return s.disk.Write(filepath.Join(s.dir, "scratch", path), records, chunks)
-}
-
-func (s *spiller) Remove(dir string, bytes int64) error {
-	if err := os.RemoveAll(filepath.Join(s.dir, "scratch", dir)); err != nil {
-		return err
+func (e *env) write(size int64, m *merge.Merger) (*spill.File, error) {
+	w, err := spill.Create(e.fsys, filepath.Join(e.dir, fmt.Sprintf("%06d.run", e.seq.Add(1))), e.wbuf)
+	if err != nil {
+		return nil, err
 	}
-	s.disk.Release(bytes)
-	return nil
+	if err := spill.Copy(context.Background(), w, m); err != nil {
+		w.Abort()
+		return nil, err
+	}
+	f, err := w.Finish()
+	if err == nil {
+		e.disk.Add(size)
+	}
+	return f, err
 }
 
-// scratchFiles returns the files in the spiller's scratch directory.
-func (s *spiller) scratchFiles(t interface{ Fatal(...any) }) []string {
-	var files []string
-	err := filepath.WalkDir(filepath.Join(s.dir, "scratch"), func(path string, d os.DirEntry, err error) error {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+// ingest appends records, in messages of up to per records of one side.
+func (e *env) ingest(t testing.TB, recs []oracle.Record, per int) {
+	t.Helper()
+	for i := 0; i < len(recs); {
+		j := i + 1
+		for j < len(recs) && j-i < per && recs[j].Side == recs[i].Side {
+			j++
 		}
-		if err == nil && !d.IsDir() {
-			files = append(files, path)
+		msg := recs[i:j]
+		if _, err := e.buf.Append(record.Side(msg[0].Side), len(msg), func(k int) ([]byte, []byte) { return msg[k].Key, msg[k].Value }); err != nil {
+			t.Fatalf("Append: %v", err)
 		}
-		return err
-	})
+		i = j
+	}
+	e.recs = append(e.recs, recs...)
+}
+
+func (e *env) spillNow(t testing.TB) {
+	t.Helper()
+	if err := e.buf.Spill(e.write); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seal seals the buffer, spilling what is in memory if it spilled before,
+// as run.Seal does.
+func (e *env) seal(t testing.TB) {
+	t.Helper()
+	spilled, err := e.buf.Seal()
 	if err != nil {
 		t.Fatal(err)
 	}
-	return files
-}
-
-// oversized reports whether a bucket of p would be oversized under the unit
-// budget.
-func oversized(p *buffer.Partitions, budget int64) bool {
-	for i := range p.Buckets() {
-		if (p.Bucket(buffer.Left, i).Bytes()+p.Bucket(buffer.Right, i).Bytes())*ExpansionFactor > budget {
-			return true
-		}
-	}
-	return false
-}
-
-// buffers returns every buffer of p.
-func buffers(p *buffer.Partitions) []*buffer.Buffer {
-	var out []*buffer.Buffer
-	for s := range 2 {
-		for i := range p.Buckets() {
-			out = append(out, p.Bucket(buffer.Side(s), i))
-		}
-		out = append(out, p.Empty(buffer.Side(s)))
-	}
-	return out
-}
-
-// sameBatches fails unless two joins sent the same batches: in the same
-// order with one worker, and in any order with more, whose units
-// interleave.
-func sameBatches(t interface{ Fatalf(string, ...any) }, parallelism int, first, second []*reconv1.JoinResponse) {
-	if len(first) != len(second) {
-		t.Fatalf("%d batches, then %d", len(first), len(second))
-	}
-	if parallelism <= 1 {
-		for i := range first {
-			if !proto.Equal(first[i], second[i]) {
-				t.Fatalf("batch %d differs between two joins of the same data", i)
-			}
-		}
-		return
-	}
-	a, b := marshalSorted(first), marshalSorted(second)
-	for i := range a {
-		if !bytes.Equal(a[i], b[i]) {
-			t.Fatalf("the batches of two joins of the same data differ: the %dth in sorted order", i)
-		}
+	if spilled {
+		e.spillNow(t)
 	}
 }
 
-// marshalSorted returns the encodings of batches, sorted.
-func marshalSorted(batches []*reconv1.JoinResponse) [][]byte {
-	out := make([][]byte, len(batches))
-	for i, b := range batches {
-		out[i], _ = proto.MarshalOptions{Deterministic: true}.Marshal(b)
+func (e *env) totals() [2]uint64 {
+	var n [2]uint64
+	for _, r := range e.recs {
+		n[r.Side]++
 	}
-	slices.SortFunc(out, bytes.Compare)
-	return out
+	return n
+}
+
+func (e *env) options(parallelism int, batch int64) Options {
+	return Options{Filter: NewFilter(nil), OutputBatchBytes: batch, Totals: e.totals(), Parallelism: parallelism}
+}
+
+// join runs a Join and returns its batches, cloned: a batch is valid only
+// until send returns.
+func (e *env) join(ctx context.Context, opts Options) ([]*reconv1.JoinResponse, Stats, error) {
+	var mu sync.Mutex
+	var out []*reconv1.JoinResponse
+	st, err := Run(ctx, e.pool, e.fsys, e.buf, opts, func(r *reconv1.JoinResponse) error {
+		mu.Lock()
+		defer mu.Unlock()
+		out = append(out, proto.Clone(r).(*reconv1.JoinResponse))
+		return nil
+	})
+	return out, st, err
 }
 
 func results(batches []*reconv1.JoinResponse) []*reconv1.JoinResult {
@@ -166,420 +157,681 @@ func results(batches []*reconv1.JoinResponse) []*reconv1.JoinResult {
 	return out
 }
 
-func rec(side oracle.Side, key, value string) oracle.Record {
-	return oracle.Record{Side: side, Key: []byte(key), Value: []byte(value)}
+// randomRecords returns n records over keys keys and empty keys, with
+// values of up to valueSize bytes, in runs of one side.
+func randomRecords(rng *rand.Rand, n, keys, valueSize int) []oracle.Record {
+	out := make([]oracle.Record, n)
+	side := oracle.Left
+	for i := range out {
+		if rng.IntN(30) == 0 {
+			side = 1 - side
+		}
+		var key []byte
+		if k := rng.IntN(keys + 1); k > 0 {
+			key = fmt.Appendf(nil, "key-%d", k)
+		}
+		v := make([]byte, rng.IntN(valueSize+1))
+		for j := range v {
+			v[j] = byte(rng.Uint32())
+		}
+		out[i] = oracle.Record{Side: side, Key: key, Value: v}
+	}
+	return out
 }
 
-var sample = []oracle.Record{
-	rec(oracle.Left, "a", "l1"),
-	rec(oracle.Right, "a", "r1"),
-	rec(oracle.Left, "a", "l2"),
-	rec(oracle.Right, "a", "r2"),
-	rec(oracle.Right, "a", "r3"),
-	rec(oracle.Left, "b", "l3"),
-	rec(oracle.Left, "b", "l4"),
-	rec(oracle.Right, "c", "r4"),
-	rec(oracle.Left, "", "l5"),
-	rec(oracle.Right, "", "r5"),
-	rec(oracle.Left, "", "l6"),
-	rec(oracle.Left, "d\x00", "l7"),
-	rec(oracle.Right, "d\x01", "r6"),
-}
-
-func TestRun_joins_like_the_oracle(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	p, totals := load(t, pool, 4, sample)
-	batches, err := collect(t.Context(), pool, nil, p, Options{Filter: NewFilter(nil), OutputBatchBytes: 1 << 20, Totals: totals})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := results(batches)
-	if d := oracle.Diff(oracle.Join(sample), got); d != "" {
-		t.Error(d)
-	}
-	for _, r := range got {
-		if m := r.GetBoth(); m != nil && string(m.GetKey()) == "a" {
-			if l := m.GetLeft(); string(l[0]) != "l1" || string(l[1]) != "l2" {
-				t.Errorf("Match left = %q, want ingest order", l)
-			}
-			if r := m.GetRight(); string(r[0]) != "r1" || string(r[2]) != "r3" {
-				t.Errorf("Match right = %q, want ingest order", r)
-			}
-		}
-	}
-	if pool.Used() != reservedBy(p) {
-		t.Errorf("pool has %d reserved after the join, buffers hold %d", pool.Used(), reservedBy(p))
-	}
-}
-
-// reservedBy returns the capacity of p's chunks.
-func reservedBy(p *buffer.Partitions) int64 {
-	var n int64
-	for s := range 2 {
-		for i := range p.Buckets() {
-			for _, c := range p.Bucket(buffer.Side(s), i).Chunks() {
-				n += int64(cap(c))
-			}
-		}
-		for _, c := range p.Empty(buffer.Side(s)).Chunks() {
-			n += int64(cap(c))
-		}
-	}
-	return n
-}
-
-func TestRun_states_filter_still_counts(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	p, totals := load(t, pool, 3, sample)
-	breaks := []reconv1.JoinState{reconv1.JoinState_JOIN_STATE_LEFT_ONLY, reconv1.JoinState_JOIN_STATE_RIGHT_ONLY}
-	batches, err := collect(t.Context(), pool, nil, p, Options{Filter: NewFilter(breaks), OutputBatchBytes: 1 << 20, Totals: totals})
-	if err != nil {
-		t.Fatalf("a filtered join failed: %v", err)
-	}
-	if d := oracle.Diff(oracle.Filter(oracle.Join(sample), breaks...), results(batches)); d != "" {
-		t.Error(d)
-	}
-}
-
-func TestRun_batches_are_deterministic_and_bounded(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	var records []oracle.Record
-	for i := range 3000 {
-		records = append(records, oracle.Record{Side: oracle.Side(i % 2), Key: []byte{byte(i % 251), byte(i % 13)}, Value: bytes.Repeat([]byte{byte(i)}, i%40)})
-	}
-	p, totals := load(t, pool, 16, records)
-	opts := Options{Filter: NewFilter(nil), OutputBatchBytes: 2048, Totals: totals}
-	first, err := collect(t.Context(), pool, nil, p, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := collect(t.Context(), pool, nil, p, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(first) < 10 || len(first) != len(second) {
-		t.Fatalf("%d and %d batches; want the same number, at least 10", len(first), len(second))
-	}
-	for i := range first {
-		if !proto.Equal(first[i], second[i]) {
-			t.Fatalf("batch %d differs between two joins of the same data", i)
-		}
-		if n := proto.Size(first[i]); n > 2048 && len(first[i].GetResults()) > 1 {
-			t.Errorf("batch %d is %d bytes with %d results, above the 2048 limit", i, n, len(first[i].GetResults()))
-		}
-	}
-	if d := oracle.Diff(oracle.Join(records), results(first)); d != "" {
-		t.Error(d)
-	}
-}
-
-func TestRun_a_dropped_record_fails_the_control_totals(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	p, totals := load(t, pool, 2, sample)
-	dropRecord.Store(true)
-	_, err := collect(t.Context(), pool, nil, p, Options{Filter: NewFilter(nil), OutputBatchBytes: 1 << 20, Totals: totals})
-	if !errors.Is(err, ErrControlTotals) {
-		t.Fatalf("Run: %v, want ErrControlTotals", err)
-	}
-	if _, err := collect(t.Context(), pool, nil, p, Options{Filter: NewFilter(nil), OutputBatchBytes: 1 << 20, Totals: totals}); err != nil {
-		t.Errorf("the next join: %v; the hook should drop only one record", err)
-	}
-}
-
-func TestRun_fails_when_the_working_set_doesnt_fit(t *testing.T) {
-	// The pool holds the buffers and the output batch, but is one byte
-	// short of an index entry per keyed record.
-	var keyed int64
-	for _, r := range sample {
-		if len(r.Key) > 0 {
-			keyed++
-		}
-	}
-	measure := mem.NewPool(1 << 30)
-	load(t, measure, 1, sample)
-	buffers := measure.Used()
-	pool := mem.NewPool(buffers + 1024 + keyed*entrySize - 1)
-	p, totals := load(t, pool, 1, sample)
-	_, err := collect(t.Context(), pool, nil, p, Options{Filter: NewFilter(nil), OutputBatchBytes: 1024, Totals: totals})
-	if !errors.Is(err, mem.ErrExhausted) {
-		t.Fatalf("Run: %v, want ErrExhausted", err)
-	}
-	if pool.Used() != buffers {
-		t.Errorf("pool has %d reserved after the failed join, %d for the buffers", pool.Used(), buffers)
-	}
-
-	pool = mem.NewPool(buffers + 1024 + keyed*entrySize)
-	p, totals = load(t, pool, 1, sample)
-	if _, err := collect(t.Context(), pool, nil, p, Options{Filter: NewFilter(nil), OutputBatchBytes: 1024, Totals: totals}); err != nil {
-		t.Errorf("Run with one more byte: %v", err)
-	}
-}
-
-func TestRun_stops_when_its_context_ends(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	p, totals := load(t, pool, 2, sample)
-	cause := errors.New("deleted")
-	ctx, cancel := context.WithCancelCause(t.Context())
-	sent := 0
-	_, err := Run(ctx, pool, nil, p, Options{Filter: NewFilter(nil), OutputBatchBytes: 1, Totals: totals}, func(*reconv1.JoinResponse) error {
-		sent++
-		cancel(cause)
-		return nil
-	})
-	if !errors.Is(err, cause) {
-		t.Fatalf("Run: %v, want the context's cause", err)
-	}
-	if sent != 1 {
-		t.Errorf("sent %d batches after the context ended, want 1", sent)
-	}
-}
-
-// genRecords draws records with duplicates, skew, empty keys, binary keys
-// and keys that differ only in their last byte.
-func genRecords(t *rapid.T) []oracle.Record {
-	var keys [][]byte
-	for _, k := range rapid.SliceOfN(rapid.SliceOfN(rapid.Byte(), 0, 10), 1, 24).Draw(t, "keys") {
-		keys = append(keys, k)
-		if len(k) > 0 {
-			twin := bytes.Clone(k)
-			twin[len(twin)-1] ^= 1
-			keys = append(keys, twin)
-		}
-	}
-	n := rapid.IntRange(0, 600).Draw(t, "records")
-	records := make([]oracle.Record, n)
-	for i := range records {
-		k := keys[0] // the hot key
-		if rapid.IntRange(0, 3).Draw(t, "hot") > 0 {
-			k = rapid.SampledFrom(keys).Draw(t, "key")
-		}
-		records[i] = oracle.Record{
-			Side:  oracle.Side(rapid.IntRange(0, 1).Draw(t, "side")),
-			Key:   k,
-			Value: rapid.SliceOfN(rapid.Byte(), 0, 12).Draw(t, "value"),
-		}
-	}
-	return records
-}
-
-func TestRun_property_matches_the_oracle(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		records := genRecords(t)
-		n := uint32(rapid.IntRange(1, 64).Draw(t, "buckets"))
-		var states []reconv1.JoinState
-		for _, s := range []reconv1.JoinState{reconv1.JoinState_JOIN_STATE_LEFT_ONLY, reconv1.JoinState_JOIN_STATE_RIGHT_ONLY, reconv1.JoinState_JOIN_STATE_BOTH} {
-			if rapid.Bool().Draw(t, "state") {
-				states = append(states, s)
-			}
-		}
-		opts := Options{
-			Filter:           NewFilter(states),
-			OutputBatchBytes: int64(rapid.IntRange(1, 4096).Draw(t, "batch")),
-		}
-
-		pool := mem.NewPool(1 << 30)
-		p, totals := load(t, pool, n, records)
-		opts.Totals = totals
-		first, err := collect(context.Background(), pool, nil, p, opts)
-		if err != nil {
-			t.Fatalf("Run: %v", err)
-		}
-		if d := oracle.Diff(oracle.Filter(oracle.Join(records), states...), results(first)); d != "" {
-			t.Fatal(d)
-		}
-		second, err := collect(context.Background(), pool, nil, p, opts)
-		if err != nil {
-			t.Fatalf("second Run: %v", err)
-		}
-		sameBatches(t, 1, first, second)
-	})
-}
-
-func TestPlan_coalesces_contiguous_buckets_up_to_the_budget(t *testing.T) {
-	for _, tc := range []struct {
+func TestRun_joins_like_the_oracle_from_memory_files_or_both(t *testing.T) {
+	for _, tt := range []struct {
 		name   string
-		sizes  []int64
-		budget int64
-		want   []Unit
+		spills []int // the record counts after which the buffer spills
+		seal   bool  // spill the rest at Seal
 	}{
-		{"none", nil, 100, nil},
-		{"all fit", []int64{1, 2, 3, 4}, 100, []Unit{{0, 4}}},
-		{"greedy", []int64{10, 10, 10, 10, 10}, 40, []Unit{{0, 2}, {2, 4}, {4, 5}}},
-		{"empty buckets join the unit", []int64{0, 0, 20, 0, 0, 1}, 40, []Unit{{0, 5}, {5, 6}}},
-		{"oversized alone", []int64{1, 100, 1, 1}, 40, []Unit{{0, 1}, {1, 2}, {2, 4}}},
-		{"oversized first", []int64{100, 1}, 40, []Unit{{0, 1}, {1, 2}}},
+		{"memory", nil, false},
+		{"one file", nil, true},
+		{"files", []int{1000, 4000, 4001}, true},
+		{"files and blocks", []int{2500, 5000}, false},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got := Plan(tc.sizes, tc.budget)
-			if !slices.Equal(got, tc.want) {
-				t.Errorf("Plan(%v, %d) = %v, want %v", tc.sizes, tc.budget, got, tc.want)
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t, 64<<20)
+			recs := randomRecords(rand.New(rand.NewPCG(1, 2)), 8000, 1500, 300)
+			at := 0
+			for _, n := range append(tt.spills, len(recs)) {
+				e.ingest(t, recs[at:n], 40)
+				at = n
+				if n < len(recs) {
+					e.spillNow(t)
+				}
+			}
+			if _, err := e.buf.Seal(); err != nil {
+				t.Fatal(err)
+			}
+			if tt.seal {
+				e.spillNow(t)
+			}
+			batches, st, err := e.join(t.Context(), e.options(3, 4096))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// One stream: each Match's values are in ingest order.
+			if d := oracle.DiffOrdered(oracle.Join(recs), results(batches)); d != "" {
+				t.Fatal(d)
+			}
+			t.Logf("%d files, %d blocks, %d workers, %d tasks, %d batches, %d reads", st.Files, st.Blocks, st.Workers, st.Tasks, st.Batches, st.Reads)
+			if e.pool.Used() != e.pool.Idle()+int64(st.Files)*spill.FileBytes+e.blockBytes() {
+				t.Errorf("the Join left %d reserved", e.pool.Used()-e.pool.Idle())
 			}
 		})
 	}
 }
 
-func TestPlan_property_covers_every_bucket_once(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		sizes := rapid.SliceOfN(rapid.Int64Range(0, 1000), 0, 300).Draw(t, "sizes")
-		budget := rapid.Int64Range(1, 5000).Draw(t, "budget")
-		units := Plan(sizes, budget)
-		next := uint32(0)
-		for i, u := range units {
-			if u.Lo != next || u.Hi <= u.Lo {
-				t.Fatalf("unit %d is %v after bucket %d", i, u, next)
-			}
-			var est int64
-			for _, s := range sizes[u.Lo:u.Hi] {
-				est += s * ExpansionFactor
-			}
-			if est > budget && u.Hi-u.Lo > 1 {
-				t.Fatalf("unit %v estimates %d, above the budget %d", u, est, budget)
-			}
-			if i+1 < len(units) && est+sizes[u.Hi]*ExpansionFactor <= budget {
-				t.Fatalf("unit %v stops before bucket %d, which fits", u, u.Hi)
-			}
-			next = u.Hi
+// blockBytes is what the buffer holds in memory.
+func (e *env) blockBytes() int64 {
+	e.spill.Store(true)
+	return e.buf.SpillSize()
+}
+
+func TestRun_property_matches_the_oracle_in_value_order(t *testing.T) {
+	h := humustest.NewHost(t, humustest.WithFiles(map[string][]byte{"data/.keep": nil}))
+	n := 0
+	rapid.Check(t, func(rt *rapid.T) {
+		n++
+		dir := h.Path(fmt.Sprintf("data/%d", n))
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			rt.Fatal(err)
 		}
-		if int(next) != len(sizes) {
-			t.Fatalf("units cover %d of %d buckets", next, len(sizes))
+		limit := rapid.Int64Range(256<<10, 8<<20).Draw(rt, "budget")
+		e := newEnvOn(h.FS(), dir, limit)
+		keys := rapid.SliceOfN(rapid.SliceOfN(rapid.Byte(), 0, 10), 1, 100).Draw(rt, "keys")
+		count := rapid.IntRange(0, 2000).Draw(rt, "records")
+		recs := make([]oracle.Record, count)
+		side := oracle.Side(rapid.IntRange(0, 1).Draw(rt, "first side"))
+		for i := range recs {
+			if rapid.IntRange(0, 10).Draw(rt, "switch") == 0 {
+				side = 1 - side
+			}
+			v := make([]byte, rapid.IntRange(0, 200).Draw(rt, "value size"))
+			for j := range v {
+				v[j] = byte(i * (j + 1))
+			}
+			recs[i] = oracle.Record{Side: side, Key: rapid.SampledFrom(keys).Draw(rt, "key"), Value: v}
 		}
-		if !slices.Equal(units, Plan(sizes, budget)) {
-			t.Fatal("two plans of the same sizes differ")
+		spills := rapid.SliceOfN(rapid.IntRange(0, count), 0, 5).Draw(rt, "spills")
+		slices.Sort(spills)
+		at := 0
+		for _, s := range spills {
+			e.ingest(t, recs[at:s], 30)
+			at = s
+			e.spillNow(t)
+		}
+		e.ingest(t, recs[at:], 30)
+		if rapid.Bool().Draw(rt, "spill at seal") {
+			e.seal(t)
+		} else if _, err := e.buf.Seal(); err != nil {
+			rt.Fatal(err)
+		}
+		opts := e.options(rapid.IntRange(1, 4).Draw(rt, "parallelism"), rapid.Int64Range(64, 8192).Draw(rt, "batch"))
+		want := oracle.Join(recs)
+		hot := firstHotKey(want, MaxMatch(limit, opts))
+		batches, _, err := e.join(context.Background(), opts)
+		if hot != nil {
+			if hk, ok := errors.AsType[*HotKeyError](err); !ok || !bytes.Equal(hk.Key, hot.GetKey()) || hk.Left != uint64(len(hot.GetLeft())) || hk.Right != uint64(len(hot.GetRight())) {
+				rt.Fatalf("Join: %v, want HOT_KEY for %q with %d and %d records", err, hot.GetKey(), len(hot.GetLeft()), len(hot.GetRight()))
+			}
+		} else {
+			if err != nil {
+				rt.Fatal(err)
+			}
+			if d := oracle.DiffOrdered(want, results(batches)); d != "" {
+				rt.Fatal(d)
+			}
+		}
+		e.buf.Free()
+		if e.pool.Used() != e.pool.Idle() {
+			rt.Fatalf("%d reserved after Free", e.pool.Used()-e.pool.Idle())
 		}
 	})
 }
 
-func TestRun_reads_spill_files_and_gives_the_same_batches(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	sp := newSpiller(t)
-	records := slices.Concat(sample, sample)
-	inMemory, totals := load(t, pool, 3, records)
-	spilled := buffer.NewPartitions(3)
-	for i, r := range records {
-		if err := spilled.Append(pool, buffer.Side(r.Side), r.Key, r.Value); err != nil {
+// firstHotKey returns the Match of results larger than maxMatch that comes
+// first in the plan: the lowest hash, then key. A Match's size is that of
+// its encoding, since a non-empty key and each value are fields.
+func firstHotKey(results []*reconv1.JoinResult, maxMatch int64) *reconv1.Match {
+	var first *reconv1.Match
+	for _, r := range results {
+		m := r.GetBoth()
+		if m == nil || int64(proto.Size(m)) <= maxMatch {
+			continue
+		}
+		if first == nil || cmp.Or(cmp.Compare(record.Hash(m.GetKey()), record.Hash(first.GetKey())), bytes.Compare(m.GetKey(), first.GetKey())) < 0 {
+			first = m
+		}
+	}
+	return first
+}
+
+func TestRun_states_filter_still_counts(t *testing.T) {
+	e := newEnv(t, 64<<20)
+	recs := randomRecords(rand.New(rand.NewPCG(3, 4)), 3000, 500, 50)
+	e.ingest(t, recs[:1500], 20)
+	e.spillNow(t)
+	e.ingest(t, recs[1500:], 20)
+	e.seal(t)
+	all := oracle.Join(recs)
+	states := []reconv1.JoinState{reconv1.JoinState_JOIN_STATE_LEFT_ONLY, reconv1.JoinState_JOIN_STATE_RIGHT_ONLY, reconv1.JoinState_JOIN_STATE_BOTH}
+	for mask := 1; mask < 8; mask++ {
+		var want []reconv1.JoinState
+		for i, s := range states {
+			if mask&(1<<i) != 0 {
+				want = append(want, s)
+			}
+		}
+		opts := e.options(2, 1024)
+		opts.Filter = NewFilter(want)
+		batches, _, err := e.join(t.Context(), opts)
+		if err != nil {
+			t.Fatalf("states %v: %v", want, err)
+		}
+		if d := oracle.DiffOrdered(oracle.Filter(all, want...), results(batches)); d != "" {
+			t.Errorf("states %v: %s", want, d)
+		}
+	}
+}
+
+func TestRun_batches_are_bounded(t *testing.T) {
+	e := newEnv(t, 64<<20)
+	recs := randomRecords(rand.New(rand.NewPCG(5, 6)), 5000, 300, 400)
+	recs = append(recs, oracle.Record{Side: oracle.Left, Key: []byte("large"), Value: make([]byte, 10<<10)})
+	e.ingest(t, recs, 50)
+	e.seal(t)
+	const limit = 2048
+	batches, _, err := e.join(t.Context(), e.options(2, limit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, b := range batches {
+		if n := proto.Size(b); n > limit && len(b.GetResults()) > 1 {
+			t.Errorf("batch %d has %d results in %d bytes, over the %d-byte limit", i, len(b.GetResults()), n, limit)
+		}
+		if len(b.GetResults()) == 0 {
+			t.Errorf("batch %d is empty", i)
+		}
+	}
+}
+
+func TestRun_property_spilling_changes_no_batch(t *testing.T) {
+	h := humustest.NewHost(t, humustest.WithFiles(map[string][]byte{"data/.keep": nil}))
+	n := 0
+	rapid.Check(t, func(rt *rapid.T) {
+		recs := randomRecords(rand.New(rand.NewPCG(rapid.Uint64().Draw(rt, "seed"), 0)), rapid.IntRange(0, 3000).Draw(rt, "records"), 200, 100)
+		batch := rapid.Int64Range(128, 4096).Draw(rt, "batch")
+		var first []*reconv1.JoinResponse
+		for _, spills := range [][]int{nil, {len(recs) / 2}, {len(recs) / 5, len(recs) / 3, len(recs) / 2}} {
+			n++
+			dir := h.Path(fmt.Sprintf("data/%d", n))
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				rt.Fatal(err)
+			}
+			e := newEnvOn(h.FS(), dir, 32<<20)
+			at := 0
+			for _, s := range spills {
+				e.ingest(t, recs[at:s], 25)
+				at = s
+				e.spillNow(t)
+			}
+			e.ingest(t, recs[at:], 25)
+			e.seal(t)
+			// One worker: the batches of every task in plan order.
+			batches, _, err := e.join(context.Background(), e.options(1, batch))
+			if err != nil {
+				rt.Fatal(err)
+			}
+			if first == nil {
+				first = batches
+				continue
+			}
+			if len(batches) != len(first) {
+				rt.Fatalf("%d batches after %d spills, %d without", len(batches), len(spills), len(first))
+			}
+			for i := range batches {
+				if !proto.Equal(batches[i], first[i]) {
+					rt.Fatalf("batch %d differs after %d spills", i, len(spills))
+				}
+			}
+		}
+	})
+}
+
+func TestRun_a_dropped_record_fails_the_control_totals(t *testing.T) {
+	e := newEnv(t, 1<<20)
+	e.ingest(t, []oracle.Record{{Key: []byte("a")}, {Side: oracle.Right, Key: []byte("a")}}, 10)
+	e.seal(t)
+	dropRecord.Store(true)
+	if _, _, err := e.join(t.Context(), e.options(1, 1024)); !errors.Is(err, ErrControlTotals) {
+		t.Fatalf("Join with a dropped record: %v, want ErrControlTotals", err)
+	}
+	if _, _, err := e.join(t.Context(), e.options(1, 1024)); err != nil {
+		t.Errorf("the next Join: %v", err)
+	}
+}
+
+func TestRun_stops_when_its_context_ends(t *testing.T) {
+	e := newEnv(t, 16<<20)
+	e.ingest(t, randomRecords(rand.New(rand.NewPCG(7, 8)), 20000, 5000, 100), 100)
+	e.spillNow(t)
+	e.seal(t)
+	cause := errors.New("the run was deleted")
+	ctx, cancel := context.WithCancelCause(t.Context())
+	sent := 0
+	_, err := Run(ctx, e.pool, e.fsys, e.buf, e.options(4, 1024), func(*reconv1.JoinResponse) error {
+		if sent++; sent == 3 {
+			cancel(cause)
+		}
+		return nil
+	})
+	if !errors.Is(err, cause) {
+		t.Fatalf("Join cancelled during a send: %v, want its cause", err)
+	}
+	if sent > 3+4 {
+		t.Errorf("%d batches sent after the cancel, want at most one per worker", sent-3)
+	}
+	if e.pool.Used()-e.pool.Idle() != spill.FileBytes {
+		t.Errorf("%d reserved after the cancelled Join", e.pool.Used()-e.pool.Idle())
+	}
+
+	// A Join of a run whose results are all filtered out stops too.
+	ctx, cancel = context.WithCancelCause(t.Context())
+	cancel(cause)
+	opts := e.options(2, 1024)
+	opts.Filter = NewFilter([]reconv1.JoinState{reconv1.JoinState_JOIN_STATE_BOTH})
+	if _, _, err := e.join(ctx, opts); !errors.Is(err, cause) {
+		t.Errorf("a cancelled Join that sends nothing: %v, want its cause", err)
+	}
+}
+
+func TestRun_a_missing_run_file_fails_the_Join(t *testing.T) {
+	e := newEnv(t, 1<<20)
+	e.ingest(t, []oracle.Record{{Key: []byte("a")}}, 10)
+	e.seal(t)
+	e.spillNow(t)
+	for _, f := range e.buf.Files() {
+		if err := os.Remove(f.Path); err != nil {
 			t.Fatal(err)
 		}
-		if i%5 == 4 {
-			for _, b := range buffers(spilled) {
-				if err := sp.spill(pool, b); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
 	}
-	var files int
-	for _, b := range buffers(spilled) {
-		files += len(b.Files())
-	}
-	if files == 0 {
-		t.Fatal("nothing was spilled")
-	}
-
-	opts := Options{Filter: NewFilter(nil), OutputBatchBytes: 64, Totals: totals, Parallelism: 1}
-	want, err := collect(t.Context(), pool, sp.disk, inMemory, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	before := pool.Used()
-	got, err := collect(t.Context(), pool, sp.disk, spilled, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sameBatches(t, opts.Parallelism, want, got)
-	if pool.Used() != before {
-		t.Errorf("pool has %d reserved after the join, %d before", pool.Used(), before)
-	}
-	if d := oracle.Diff(oracle.Join(records), results(got)); d != "" {
-		t.Error(d)
+	if _, _, err := e.join(t.Context(), e.options(1, 1024)); err == nil {
+		t.Error("a Join of a run whose file is gone succeeded")
 	}
 }
 
-func TestRun_a_missing_spill_file_fails_the_join(t *testing.T) {
-	pool := mem.NewPool(1 << 30)
-	sp := newSpiller(t)
-	p, totals := load(t, pool, 1, sample)
-	if err := sp.spill(pool, p.Bucket(buffer.Left, 0)); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(p.Bucket(buffer.Left, 0).Files()[0].Path); err != nil {
-		t.Fatal(err)
-	}
-	opts := Options{Filter: NewFilter(nil), OutputBatchBytes: 1024, Totals: totals}
-	if _, err := collect(t.Context(), pool, sp.disk, p, opts); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("Run: %v, want the file's ErrNotExist", err)
-	}
-
-	// The files of a deleted run are removed with it, so the abort is
-	// reported, not the missing file.
-	ctx, cancel := context.WithCancelCause(t.Context())
-	cause := errors.New("deleted")
-	cancel(cause)
-	if _, err := collect(ctx, pool, sp.disk, p, opts); !errors.Is(err, cause) {
-		t.Errorf("Run with its context done: %v, want the cause", err)
-	}
-}
-
-// TestRun_property_spilling_changes_no_batch joins the same records twice,
-// once in memory and once with buffers spilled at random points, under a
-// budget that splits them into several units: the batches must be the
-// same, and equal the oracle's results.
-func TestRun_property_spilling_changes_no_batch(t *testing.T) {
-	sp := newSpiller(t)
+func TestPlan_property_covers_every_fence_once_in_balanced_tasks(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		records := genRecords(t)
-		n := uint32(rapid.IntRange(1, 64).Draw(t, "buckets"))
-		pool := mem.NewPool(1 << 30)
-		inMemory, totals := load(t, pool, n, records)
-		spilled := buffer.NewPartitions(n)
-		all := buffers(spilled)
-		for _, r := range records {
-			if err := spilled.Append(pool, buffer.Side(r.Side), r.Key, r.Value); err != nil {
-				t.Fatal(err)
+		sizes := rapid.SliceOfN(rapid.Int64Range(0, 1000), record.Fences, record.Fences).Draw(t, "sizes")
+		n := rapid.IntRange(1, 40).Draw(t, "tasks")
+		tasks := plan(sizes, n)
+		var total, largest int64
+		for _, s := range sizes {
+			total += s
+			largest = max(largest, s)
+		}
+		if total == 0 {
+			if len(tasks) != 0 {
+				t.Fatalf("%d tasks of no bytes", len(tasks))
 			}
-			if rapid.IntRange(0, 9).Draw(t, "spill") == 0 {
-				if err := sp.spill(pool, rapid.SampledFrom(all).Draw(t, "buffer")); err != nil {
-					t.Fatal(err)
-				}
+			return
+		}
+		if len(tasks) > n || tasks[0].lo != 0 || tasks[len(tasks)-1].hi != record.Fences {
+			t.Fatalf("plan %v of %d tasks", tasks, n)
+		}
+		for i, tk := range tasks {
+			if tk.lo >= tk.hi || i > 0 && tk.lo != tasks[i-1].hi {
+				t.Fatalf("plan %v doesn't cover the fences once, in order", tasks)
 			}
-		}
-
-		var bytes, count int64
-		for _, b := range all {
-			bytes += b.Bytes()
-			count += b.Records()
-		}
-		opts := Options{
-			Filter:           NewFilter(nil),
-			OutputBatchBytes: int64(rapid.IntRange(1, 4096).Draw(t, "batch")),
-			Totals:           totals,
-			Parallelism:      rapid.IntRange(1, 4).Draw(t, "parallelism"),
-		}
-		// The join reserves from its own pool, whose limit sets the unit
-		// budget: it holds an output batch for each worker and the largest
-		// working set possible, all of the records.
-		// An oversized bucket is sub-partitioned, which takes write buffers
-		// besides: 32 KiB a unit holds those, and then no key of these
-		// records is hot.
-		opts.Scratch = sp
-		limit := int64(opts.Parallelism)*opts.OutputBatchBytes + bytes + count*entrySize + rapid.Int64Range(0, 4*bytes).Draw(t, "extra")
-		if oversized(inMemory, limit/int64(opts.Parallelism)) {
-			limit = max(limit, int64(opts.Parallelism)*32<<10)
-		}
-		joinPool := mem.NewPool(limit)
-		want, err := collect(context.Background(), joinPool, sp.disk, inMemory, opts)
-		if err != nil {
-			t.Fatalf("Run in memory: %v", err)
-		}
-		got, err := collect(context.Background(), joinPool, sp.disk, spilled, opts)
-		if err != nil {
-			t.Fatalf("Run with spill files: %v", err)
-		}
-		sameBatches(t, opts.Parallelism, want, got)
-		if d := oracle.Diff(oracle.Join(records), results(got)); d != "" {
-			t.Fatal(d)
-		}
-		if joinPool.Used() != 0 {
-			t.Fatalf("the join's pool has %d reserved after the joins", joinPool.Used())
+			var b int64
+			for _, s := range sizes[tk.lo:tk.hi] {
+				b += s
+			}
+			if b > total/int64(n)+2*largest {
+				t.Fatalf("task %v has %d bytes, more than a share of %d and two fences", tk, b, total/int64(n))
+			}
 		}
 	})
+}
+
+// hotRecords returns left then right records of key, with values of size
+// bytes, each value numbered.
+func hotRecords(key []byte, left, right, size int) []oracle.Record {
+	var out []oracle.Record
+	for i := range left + right {
+		side := oracle.Left
+		if i >= left {
+			side = oracle.Right
+		}
+		v := make([]byte, size)
+		copy(v, fmt.Appendf(nil, "%08d", i))
+		out = append(out, oracle.Record{Side: side, Key: key, Value: v})
+	}
+	return out
+}
+
+func TestRun_HOT_KEY_for_a_Match_above_the_maximum(t *testing.T) {
+	for _, filter := range [][]reconv1.JoinState{nil, {reconv1.JoinState_JOIN_STATE_LEFT_ONLY}} {
+		t.Run(fmt.Sprint(filter), func(t *testing.T) {
+			e := newEnv(t, 8<<20)
+			key := []byte("hot")
+			others := randomRecords(rand.New(rand.NewPCG(9, 9)), 3000, 500, 100)
+			e.ingest(t, others[:1500], 50)
+			e.ingest(t, hotRecords(key, 300, 200, 1000), 50)
+			e.spillNow(t)
+			e.ingest(t, others[1500:], 50)
+			e.seal(t)
+			opts := e.options(3, 4096)
+			opts.Filter = NewFilter(filter)
+			opts.MaxMatchBytes = 256 << 10
+			var first *HotKeyError
+			for range 2 {
+				_, _, err := e.join(t.Context(), opts)
+				hk, ok := errors.AsType[*HotKeyError](err)
+				if !ok {
+					t.Fatalf("Join: %v, want a HotKeyError", err)
+				}
+				size := proto.Size(&reconv1.Match{Key: key, Left: make([][]byte, 300), Right: make([][]byte, 200)}) + 500*1000 + 500*1 // each value's length takes one more byte
+				if !bytes.Equal(hk.Key, key) || hk.Left != 300 || hk.Right != 200 || hk.Limit != 256<<10 || hk.Size < int64(size)-1000 || hk.Size > int64(size)+1000 {
+					t.Errorf("HotKeyError %+v, want the key's 300 and 200 records in a Match of about %d bytes", hk, size)
+				}
+				if first != nil && hk.Error() != first.Error() {
+					t.Errorf("the second Join failed with %v, the first with %v", hk, first)
+				}
+				first = hk
+			}
+		})
+	}
+}
+
+func TestRun_reports_the_first_hot_key_of_the_plan(t *testing.T) {
+	e := newEnv(t, 16<<20)
+	var keys [][]byte
+	for i := 0; len(keys) < 6; i++ {
+		k := fmt.Appendf(nil, "hot-%d", i)
+		// Keys far apart in the hash, so that they fall in different tasks.
+		if f := record.Fence(record.Hash(k)); f%40 == 0 && !slices.ContainsFunc(keys, func(o []byte) bool { return record.Fence(record.Hash(o)) == f }) {
+			keys = append(keys, k)
+		}
+	}
+	for _, k := range keys {
+		e.ingest(t, hotRecords(k, 100, 100, 200), 50)
+	}
+	e.ingest(t, randomRecords(rand.New(rand.NewPCG(10, 10)), 20000, 5000, 100), 100)
+	e.seal(t)
+	first := slices.MinFunc(keys, func(a, b []byte) int { return cmp.Compare(record.Hash(a), record.Hash(b)) })
+	opts := e.options(4, 4096)
+	opts.MaxMatchBytes = 16 << 10
+	for range 10 {
+		_, _, err := e.join(t.Context(), opts)
+		if hk, ok := errors.AsType[*HotKeyError](err); !ok || !bytes.Equal(hk.Key, first) {
+			t.Fatalf("Join: %v, want the HotKeyError of %q, the first in the plan", err, first)
+		}
+	}
+}
+
+func TestRun_streams_a_one_sided_key_at_any_size(t *testing.T) {
+	for _, side := range []oracle.Side{oracle.Left, oracle.Right} {
+		t.Run(fmt.Sprint(side), func(t *testing.T) {
+			// 20 MiB of one key under a 4 MiB budget and a 256 KiB maximum
+			// Match: it is never held, however it is spread over files.
+			e := newEnv(t, 4<<20)
+			key := []byte("one-sided")
+			n := 20_000
+			left, right := n, 0
+			if side == oracle.Right {
+				left, right = 0, n
+			}
+			hot := hotRecords(key, left, right, 1000)
+			others := randomRecords(rand.New(rand.NewPCG(11, 11)), 4000, 1000, 100)
+			e.ingest(t, others[:2000], 50)
+			e.ingest(t, hot, 50) // the pool spills as they come
+			e.ingest(t, others[2000:], 50)
+			e.seal(t)
+			if len(e.buf.Files()) < 3 {
+				t.Fatalf("%d files, want the key spread over several", len(e.buf.Files()))
+			}
+			opts := e.options(2, 64<<10)
+			opts.MaxMatchBytes = 256 << 10
+			for range 2 {
+				batches, st, err := e.join(t.Context(), opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if d := oracle.DiffOrdered(oracle.Join(e.recs), results(batches)); d != "" {
+					t.Fatal(d)
+				}
+				// The key's results keep their ingest order.
+				var vals [][]byte
+				for _, r := range results(batches) {
+					if rec := cmp.Or(r.GetLeftOnly(), r.GetRightOnly()); rec != nil && bytes.Equal(rec.GetKey(), key) {
+						vals = append(vals, rec.GetValue())
+					}
+				}
+				if len(vals) != n || !slices.IsSortedFunc(vals, bytes.Compare) {
+					t.Errorf("%d results of the key, sorted %v; want %d in ingest order", len(vals), slices.IsSortedFunc(vals, bytes.Compare), n)
+				}
+				if want := int64(1 - side); st.Streamed != want {
+					t.Errorf("%d keys streamed, want %d: a left key streams once it outgrows a Match, a right one never needs to", st.Streamed, want)
+				}
+				if e.pool.Peak() > e.pool.Limit() {
+					t.Errorf("pool peak %d above its limit", e.pool.Peak())
+				}
+			}
+		})
+	}
+}
+
+// TestRun_large_values_are_read_when_emitted joins values of 1 to 4 MiB
+// from files, which no read buffer holds: a cursor keeps the key, and the
+// value is read into the arena when it is emitted.
+func TestRun_large_values_are_read_when_emitted(t *testing.T) {
+	for _, limit := range []int64{128 << 20, 24 << 20} {
+		t.Run(fmt.Sprint(limit>>20, "MiB"), func(t *testing.T) {
+			e := newEnv(t, limit)
+			rng := rand.New(rand.NewPCG(12, 12))
+			var recs []oracle.Record
+			for i := range 40 {
+				v := make([]byte, 1<<20+rng.IntN(3<<20))
+				for j := 0; j < len(v); j += 4096 {
+					v[j] = byte(i)
+				}
+				side := oracle.Side(i % 2)
+				recs = append(recs, oracle.Record{Side: side, Key: fmt.Appendf(nil, "k%d", i%25), Value: v})
+			}
+			recs = append(recs, randomRecords(rng, 5000, 1000, 100)...)
+			for i := 0; i < len(recs); i += 500 {
+				e.ingest(t, recs[i:min(i+500, len(recs))], 1)
+				e.spillNow(t)
+			}
+			e.seal(t)
+			opts := e.options(4, 1<<20)
+			opts.MaxMatchBytes = 12 << 20
+			var mu sync.Mutex
+			var got []*reconv1.JoinResult
+			st, err := Run(t.Context(), e.pool, e.fsys, e.buf, opts, func(r *reconv1.JoinResponse) error {
+				mu.Lock()
+				defer mu.Unlock()
+				got = append(got, proto.Clone(r).(*reconv1.JoinResponse).GetResults()...)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if d := oracle.DiffOrdered(oracle.Join(recs), got); d != "" {
+				t.Fatal(d)
+			}
+			t.Logf("%d files, %d workers, read buffers of %d bytes, pool peak %d MiB", st.Files, st.Workers, st.ReadBuffer, e.pool.Peak()>>20)
+			if st.ReadBuffer >= 1<<20 {
+				t.Errorf("read buffers of %d bytes hold the values whole", st.ReadBuffer)
+			}
+		})
+	}
+}
+
+// TestRun_a_Match_needs_its_size_once builds a Match of 4.5 MiB under an
+// 8 MiB budget, which a contiguous arena that grows by copying couldn't,
+// and fails a Match over the maximum with HOT_KEY, not memory exhausted.
+func TestRun_a_Match_needs_its_size_once(t *testing.T) {
+	for _, tt := range []struct {
+		left, right int
+		hot         bool
+	}{{4400, 100, false}, {5500, 100, true}} {
+		t.Run(fmt.Sprint(tt.left), func(t *testing.T) {
+			e := newEnv(t, 8<<20)
+			key := []byte("big")
+			e.ingest(t, hotRecords(key, tt.left, tt.right, 1000), 100)
+			e.ingest(t, randomRecords(rand.New(rand.NewPCG(13, 13)), 2000, 500, 100), 100)
+			e.seal(t)
+			opts := e.options(1, 1<<20)
+			opts.MaxMatchBytes = 5 << 20
+			batches, _, err := e.join(t.Context(), opts)
+			if tt.hot {
+				if hk, ok := errors.AsType[*HotKeyError](err); !ok || !bytes.Equal(hk.Key, key) {
+					t.Fatalf("Join of a Match over the maximum: %v, want HOT_KEY", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Join of a %d-value Match under an 8 MiB budget: %v", tt.left+tt.right, err)
+			}
+			if d := oracle.DiffOrdered(oracle.Join(e.recs), results(batches)); d != "" {
+				t.Fatal(d)
+			}
+			if e.pool.Peak() > e.pool.Limit() {
+				t.Errorf("pool peak %d above its limit", e.pool.Peak())
+			}
+		})
+	}
+}
+
+// TestRun_gives_up_workers_before_read_buffers_get_small joins many files
+// under a small budget.
+// TestRun_runs_the_workers_a_tiny_budget_holds asks for 64 workers with
+// output batches of 1 MiB under a 4 MiB budget: one runs.
+func TestRun_runs_the_workers_a_tiny_budget_holds(t *testing.T) {
+	e := newEnv(t, 4<<20)
+	recs := randomRecords(rand.New(rand.NewPCG(16, 16)), 50_000, 10_000, 300)
+	e.ingest(t, recs, 100)
+	e.seal(t)
+	opts := e.options(64, 1<<20)
+	opts.MaxMatchBytes = 3 << 20
+	batches, st, err := e.join(t.Context(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := oracle.DiffOrdered(oracle.Join(recs), results(batches)); d != "" {
+		t.Fatal(d)
+	}
+	if st.Workers != 1 {
+		t.Errorf("%d workers under a 4 MiB budget with 1 MiB batches, want 1", st.Workers)
+	}
+}
+
+// TestRun_batches_of_small_results_fit_their_structs joins 400,000 small
+// records under an 8 MiB budget with batches of 1 MiB, which, of results of
+// 40 bytes, would take four times that in structs, next to a Match of
+// 20,000 values.
+func TestRun_batches_of_small_results_fit_their_structs(t *testing.T) {
+	e := newEnv(t, 8<<20)
+	recs := randomRecords(rand.New(rand.NewPCG(17, 17)), 400_000, 130_000, 64)
+	for i := range recs {
+		if i%20 == 0 {
+			recs[i].Key = []byte("hot") // a Match of 20,000 values, within the maximum
+		}
+	}
+	e.ingest(t, recs, 300)
+	e.seal(t)
+	opts := e.options(4, 1<<20)
+	opts.MaxMatchBytes = 3 << 20
+	batches, _, err := e.join(t.Context(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := oracle.DiffOrdered(oracle.Join(recs), results(batches)); d != "" {
+		t.Fatal(d)
+	}
+	if e.pool.Peak() > e.pool.Limit() {
+		t.Errorf("pool peak %d above its limit", e.pool.Peak())
+	}
+	for i, b := range batches {
+		if n := int64(len(b.GetResults())); n > 1 && (n-1)*resultBytes > opts.OutputBatchBytes {
+			t.Fatalf("batch %d holds %d results, whose structs take %d bytes, over the %d-byte limit", i, n, n*resultBytes, opts.OutputBatchBytes)
+		}
+	}
+}
+
+func TestRun_gives_up_workers_before_read_buffers_get_small(t *testing.T) {
+	e := newEnv(t, 2<<20)
+	recs := randomRecords(rand.New(rand.NewPCG(14, 14)), 200_000, 50_000, 200)
+	e.ingest(t, recs, 100)
+	e.seal(t)
+	files := len(e.buf.Files())
+	batches, st, err := e.join(t.Context(), e.options(4, 16<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := oracle.DiffOrdered(oracle.Join(recs), results(batches)); d != "" {
+		t.Fatal(d)
+	}
+	t.Logf("%d files, %d workers, read buffers of %d bytes", files, st.Workers, st.ReadBuffer)
+	if st.Workers == 4 || st.ReadBuffer < minReadBuf {
+		t.Errorf("%d workers with read buffers of %d bytes for %d files: want fewer workers, with buffers of at least %d", st.Workers, st.ReadBuffer, files, minReadBuf)
+	}
+}
+
+// files writes runs for Compact in the env's directory.
+type envFiles struct{ e *env }
+
+func (f envFiles) Create(size int64, buf []byte) (*spill.Writer, error) {
+	f.e.disk.Add(size)
+	return spill.Create(f.e.fsys, filepath.Join(f.e.dir, fmt.Sprintf("%06d.run", f.e.seq.Add(1))), buf)
+}
+
+func (f envFiles) Unreserve(size int64) { f.e.disk.Add(-size) }
+
+func (f envFiles) Remove(files []*spill.File) {
+	for _, file := range files {
+		if os.Remove(file.Path) == nil {
+			f.e.disk.Add(-file.Bytes)
+		}
+	}
+}
+
+func TestCompact_merges_files_until_one_worker_reads_them(t *testing.T) {
+	e := newEnv(t, 256<<10)
+	recs := randomRecords(rand.New(rand.NewPCG(15, 15)), 50000, 10000, 200)
+	e.ingest(t, recs, 100)
+	e.seal(t)
+	before := len(e.buf.Files())
+	disk := e.disk.Load()
+	opts := e.options(2, 16<<10)
+	st, err := Compact(t.Context(), e.pool, e.fsys, e.buf, envFiles{e}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := len(e.buf.Files())
+	most := int(readBudget(e.pool, 1, MaxMatch(e.pool.Limit(), opts), opts.OutputBatchBytes) / mergeReadBuf)
+	t.Logf("%d files merged to %d in %d merges of %d bytes", before, after, st.Merges, st.Bytes)
+	if st.Merges == 0 || after > max(most, 2) || after >= before {
+		t.Errorf("%d files merged to %d in %d merges; want at most %d", before, after, st.Merges, most)
+	}
+	if e.disk.Load() != disk {
+		t.Errorf("%d bytes of files after the merges, %d before", e.disk.Load(), disk)
+	}
+	if entries, _ := os.ReadDir(e.dir); len(entries) != after+1 { // and .keep
+		t.Errorf("%d entries in the run's directory, want its %d files", len(entries)-1, after)
+	}
+	if e.pool.Used()-e.pool.Idle() != int64(after)*spill.FileBytes {
+		t.Errorf("%d reserved after the merges, want the %d files' tables", e.pool.Used()-e.pool.Idle(), after)
+	}
+	batches, _, err := e.join(t.Context(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := oracle.DiffOrdered(oracle.Join(recs), results(batches)); d != "" {
+		t.Fatal(d)
+	}
 }

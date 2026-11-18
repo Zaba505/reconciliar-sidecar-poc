@@ -100,7 +100,7 @@ const (
 	ErrorReason_ERROR_REASON_MEMORY_EXHAUSTED   ErrorReason = 7  // RESOURCE_EXHAUSTED
 	ErrorReason_ERROR_REASON_DISK_EXHAUSTED     ErrorReason = 8  // RESOURCE_EXHAUSTED
 	ErrorReason_ERROR_REASON_TOO_MANY_RUNS      ErrorReason = 9  // RESOURCE_EXHAUSTED
-	ErrorReason_ERROR_REASON_HOT_KEY            ErrorReason = 10 // RESOURCE_EXHAUSTED
+	ErrorReason_ERROR_REASON_HOT_KEY            ErrorReason = 10 // RESOURCE_EXHAUSTED (a Match over the maximum match size)
 )
 
 // Enum value maps for ErrorReason.
@@ -312,9 +312,9 @@ func (x *RecordBatch) GetRecords() []*Record {
 
 type CreateRunRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Required. Number of hash buckets, from 1 to the sidecar's maximum.
-	// There is no default: size it from the expected data volume. Small
-	// buckets are coalesced at join time, so erring high is cheap.
+	// Required, from 1 to the sidecar's maximum, and otherwise ignored: the
+	// sidecar sorts records instead of partitioning them into buckets, so
+	// nothing needs sizing to the data.
 	BucketCount   uint32 `protobuf:"varint,1,opt,name=bucket_count,json=bucketCount,proto3" json:"bucket_count,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

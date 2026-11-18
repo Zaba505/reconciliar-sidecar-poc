@@ -12,26 +12,29 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
+	"runtime"
+	"runtime/debug"
+	"runtime/metrics"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/z5labs/humus/humustest"
 	"google.golang.org/protobuf/proto"
 	"pgregory.net/rapid"
 
 	reconv1 "poc/gen/recon/v1"
-	"poc/internal/buffer"
 	"poc/internal/join"
 	"poc/internal/mem"
 	"poc/internal/oracle"
+	"poc/internal/record"
 	"poc/internal/spill"
 )
 
 // message is one ingest message: records of one side.
 type message struct {
-	side    buffer.Side
+	side    record.Side
 	records []*reconv1.Record
 	size    int64
 }
@@ -42,7 +45,7 @@ func messages(records []oracle.Record, per int) ([]message, []oracle.Record) {
 	var msgs []message
 	for i, r := range records {
 		if i == 0 || r.Side != records[i-1].Side || len(msgs[len(msgs)-1].records) == per {
-			msgs = append(msgs, message{side: buffer.Side(r.Side)})
+			msgs = append(msgs, message{side: record.Side(r.Side)})
 		}
 		m := &msgs[len(msgs)-1]
 		m.records = append(m.records, &reconv1.Record{Key: r.Key, Value: r.Value})
@@ -97,20 +100,13 @@ func randomRecords(rng *rand.Rand, n, keys, valueSize int) []oracle.Record {
 	return out
 }
 
-func joinRun(r *Run) ([]*reconv1.JoinResult, error) {
-	var out []*reconv1.JoinResult
-	err := r.Join(context.Background(), join.NewFilter(nil), func(resp *reconv1.JoinResponse) error {
-		out = append(out, proto.Clone(resp).(*reconv1.JoinResponse).GetResults()...)
-		return nil
-	})
-	return out, err
-}
+func joinRun(r *Run) ([]*reconv1.JoinResult, error) { return joinAll(r) }
 
-var spillPath = regexp.MustCompile(`^(left|right)/([0-9]+|empty)/[0-9]+\.rec$`)
+var runFilePath = regexp.MustCompile(`^[0-9]{6}\.run$`)
 
-// spillFiles returns the spill files under a run's directory, relative to
-// it, and fails the test on a file that doesn't follow the layout.
-func spillFiles(t *testing.T, dir string) []string {
+// runFiles returns the files in a run's directory, and fails the test on a
+// file that doesn't follow the layout.
+func runFileNames(t *testing.T, dir string) []string {
 	t.Helper()
 	var files []string
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
@@ -118,8 +114,8 @@ func spillFiles(t *testing.T, dir string) []string {
 			return err
 		}
 		rel, _ := filepath.Rel(dir, path)
-		if !spillPath.MatchString(rel) {
-			t.Errorf("spill file %s isn't at <side>/<bucket>/<seq>.rec", rel)
+		if !runFilePath.MatchString(rel) {
+			t.Errorf("run file %s isn't at <seq>.run", rel)
 		}
 		files = append(files, rel)
 		return nil
@@ -139,12 +135,24 @@ func TestRun_spills_past_the_budget_and_joins_like_the_oracle(t *testing.T) {
 	if err := ingestStreams(r, 3, msgs); err != nil {
 		t.Fatal(err)
 	}
-	files := spillFiles(t, r.dir)
+	files := runFileNames(t, r.dir)
 	if len(files) == 0 || e.disk.Used() == 0 {
-		t.Fatalf("%d spill files, %d bytes on disk; want 2 MiB of records to spill under a 256 KiB budget", len(files), e.disk.Used())
+		t.Fatalf("%d run files, %d bytes on disk; want 2 MiB of records to spill under a 256 KiB budget", len(files), e.disk.Used())
 	}
 	if _, err := r.Seal(); err != nil {
 		t.Fatal(err)
+	}
+	// Seal wrote the rest as one more file, and merged files until one
+	// worker reads them.
+	sealed := logs.find("run sealed")
+	if len(sealed) != 1 || sealed[0]["recon.run_files"].Int64() != int64(len(r.buf.Files())) || sealed[0]["recon.spills"].Int64() < int64(len(files)+1) {
+		t.Errorf("run sealed records %v, want one with the run's %d files, after %d spills or more", sealed, len(r.buf.Files()), len(files)+1)
+	}
+	if got := runFileNames(t, r.dir); len(got) != len(r.buf.Files()) {
+		t.Errorf("%d files in the run's directory, the run has %d", len(got), len(r.buf.Files()))
+	}
+	if e.inUse() != int64(len(r.buf.Files()))*spill.FileBytes {
+		t.Errorf("a sealed run that spilled holds %d bytes, want its files' tables only", e.inUse())
 	}
 	got, err := joinRun(r)
 	if err != nil {
@@ -168,20 +176,14 @@ func TestRun_spills_past_the_budget_and_joins_like_the_oracle(t *testing.T) {
 		t.Fatalf("%d join finished records, want one per Join", len(finished))
 	}
 	attrs := finished[1]
-	if attrs["recon.run_id"].String() != id || attrs["recon.join_units"].Int64() < 2 {
-		t.Errorf("join finished record %v, want the run's ID and its units", attrs)
+	if attrs["recon.run_id"].String() != id || attrs["recon.join_files"].Int64() != int64(len(r.buf.Files())) || attrs["recon.join_workers"].Int64() < 1 || attrs["recon.join_tasks"].Int64() < 2 {
+		t.Errorf("join finished record %v, want the run's ID, files, workers and tasks", attrs)
 	}
 	if attrs["recon.pool_peak_bytes"].Int64() != e.pool.Peak() || attrs["recon.disk_peak_bytes"].Int64() != e.disk.Peak() {
 		t.Errorf("join finished record %v, want the pool's peak %d and the disk's %d", attrs, e.pool.Peak(), e.disk.Peak())
 	}
-	if attrs["recon.go_peak_bytes"].Int64() <= 0 {
-		t.Errorf("join finished record %v, want the Go runtime's peak memory", attrs)
-	}
-	// Spilled records are read back at their size, in-memory ones take
-	// their chunks' capacity, and each has an index entry besides.
-	largest, working := attrs["recon.largest_unit_record_bytes"].Int64(), attrs["recon.largest_unit_working_set_bytes"].Int64()
-	if f := attrs["recon.expansion_factor"].Float64(); f <= 1 || f > 2 || largest == 0 || working <= largest {
-		t.Errorf("join finished record %v, want an expansion factor between 1 and 2, of the largest unit too", attrs)
+	if attrs["recon.go_peak_bytes"].Int64() <= 0 || attrs["recon.join_read_buffer_bytes"].Int64() < spill.Align {
+		t.Errorf("join finished record %v, want the Go runtime's peak memory and the read buffers' size", attrs)
 	}
 
 	if err := e.m.Delete(id); err != nil {
@@ -190,8 +192,30 @@ func TestRun_spills_past_the_budget_and_joins_like_the_oracle(t *testing.T) {
 	if _, err := os.Stat(r.dir); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("run directory after Delete: %v", err)
 	}
-	if e.pool.Used() != 0 || e.disk.Used() != 0 {
-		t.Errorf("after Delete: %d bytes reserved, %d on disk", e.pool.Used(), e.disk.Used())
+	if e.inUse() != 0 || e.disk.Used() != 0 {
+		t.Errorf("after Delete: %d bytes reserved, %d on disk", e.inUse(), e.disk.Used())
+	}
+}
+
+func TestRun_a_run_that_never_spilled_stays_in_memory(t *testing.T) {
+	e := newEnvWithDisk(t, 1<<20, 1)
+	_, r := e.create(t, 4)
+	msgs, records := messages(randomRecords(rand.New(rand.NewPCG(2, 1)), 2000, 300, 100), 50)
+	if err := ingestStreams(r, 2, msgs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Seal(); err != nil {
+		t.Fatalf("Seal of a run in memory with no disk: %v", err)
+	}
+	got, err := joinRun(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := oracle.Diff(oracle.Join(records), got); d != "" {
+		t.Error(d)
+	}
+	if files := runFileNames(t, r.dir); len(files) != 0 {
+		t.Errorf("run files of a run that fits in memory: %v", files)
 	}
 }
 
@@ -211,8 +235,8 @@ func TestRun_DISK_EXHAUSTED_during_ingest_fails_the_run(t *testing.T) {
 	if err := e.m.Delete(id); err != nil {
 		t.Fatal(err)
 	}
-	if e.pool.Used() != 0 || e.disk.Used() != 0 {
-		t.Fatalf("after Delete: %d bytes reserved, %d on disk", e.pool.Used(), e.disk.Used())
+	if e.inUse() != 0 || e.disk.Used() != 0 {
+		t.Fatalf("after Delete: %d bytes reserved, %d on disk", e.inUse(), e.disk.Used())
 	}
 
 	// The disk is free again.
@@ -252,7 +276,7 @@ func TestRun_DISK_EXHAUSTED_fails_the_reserving_run_only(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = in.Append(buffer.Left, records(buffer.Left, "a"), e.pool.Limit()-e.pool.Used()+1)
+	err = in.Append(record.Left, records(record.Left, "a"), e.pool.Limit()-e.pool.Used()+e.pool.Idle()+1)
 	if !errors.Is(err, spill.ErrDiskExhausted) {
 		t.Fatalf("Append: %v, want ErrDiskExhausted", err)
 	}
@@ -272,34 +296,78 @@ func TestRun_DISK_EXHAUSTED_fails_the_reserving_run_only(t *testing.T) {
 	}
 }
 
-func TestRun_DISK_EXHAUSTED_during_a_Join_leaves_the_run_SEALED(t *testing.T) {
-	e := newEnvWithDisk(t, 64<<10, 1)
-	// A unit takes the whole budget, so that the run's bucket isn't
-	// oversized, which sub-partitioning would need the disk for.
-	e.m.cfg.JoinParallelism = 1
-	otherID, other := e.create(t, 1)
-	msgs, _ := messages(randomRecords(rand.New(rand.NewPCG(5, 5)), 160, 50, 200), 10)
-	if err := ingestStreams(other, 1, msgs); err != nil {
-		t.Fatal(err)
-	}
-	otherBytes := e.pool.Used()
-
-	// Many small records, so that the run's index takes the room the other
-	// run's buffers hold.
-	_, r := e.create(t, 1)
-	msgs, records := messages(randomRecords(rand.New(rand.NewPCG(6, 6)), 1000, 900, 8), 50)
+// TestRun_DISK_EXHAUSTED_at_Seal_leaves_the_run_OPEN fills the disk with
+// another run's files, so that a run that spilled can't write its last
+// file. Nothing is lost, so the run stays OPEN, and once the disk has room
+// Seal succeeds.
+func TestRun_DISK_EXHAUSTED_at_Seal_leaves_the_run_OPEN(t *testing.T) {
+	e := newEnvWithDisk(t, 128<<10, 1<<20)
+	_, r := e.create(t, 4)
+	msgs, records := messages(randomRecords(rand.New(rand.NewPCG(5, 4)), 3000, 500, 100), 50)
 	if err := ingestStreams(r, 1, msgs); err != nil {
 		t.Fatal(err)
 	}
-	need := e.m.cfg.OutputBatchBytes + int64(len(records))*16
-	if e.disk.Used() != 0 || e.pool.Used()+need <= e.pool.Limit() || e.pool.Used()-otherBytes+need > e.pool.Limit() {
-		t.Fatalf("%d bytes reserved, %d of them the other run's, %d on disk: want the Join's %d bytes to fit only once the other run is spilled",
-			e.pool.Used(), otherBytes, e.disk.Used(), need)
+	if e.disk.Used() == 0 {
+		t.Fatal("the run didn't spill")
+	}
+	// Another run takes what is left of the disk.
+	otherID, _ := e.create(t, 1)
+	filler := e.disk.Limit() - e.disk.Used()
+	if err := e.disk.Reserve(filler); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Seal()
+	if !errors.Is(err, spill.ErrDiskExhausted) {
+		t.Fatalf("Seal with a full disk: %v, want ErrDiskExhausted", err)
+	}
+	if _, err := joinRun(r); reason(err) != reconv1.ErrorReason_ERROR_REASON_RUN_WRONG_STATE {
+		t.Errorf("Join after a failed Seal: %v, want the run not sealed", err)
+	}
+	// More records may come, and the run seals once the disk has room.
+	more, extra := messages(randomRecords(rand.New(rand.NewPCG(6, 4)), 50, 500, 100), 50)
+	if err := ingestStreams(r, 1, more); err != nil {
+		t.Fatalf("Ingest after a failed Seal: %v", err)
+	}
+	e.disk.Release(filler)
+	if err := e.m.Delete(otherID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Seal(); err != nil {
+		t.Fatalf("Seal once the disk has room: %v", err)
+	}
+	got, err := joinRun(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := oracle.Diff(oracle.Join(append(records, extra...)), got); d != "" {
+		t.Error(d)
+	}
+}
+
+func TestRun_DISK_EXHAUSTED_during_a_Join_leaves_the_run_SEALED(t *testing.T) {
+	e := newEnvWithDisk(t, 64<<10, 1)
+	e.m.cfg.JoinParallelism = 1
+	otherID, other := e.create(t, 1)
+	msgs, _ := messages(randomRecords(rand.New(rand.NewPCG(5, 5)), 100, 50, 200), 10)
+	if err := ingestStreams(other, 1, msgs); err != nil {
+		t.Fatal(err)
+	}
+	_, r := e.create(t, 1)
+	msgs, records := messages(randomRecords(rand.New(rand.NewPCG(6, 6)), 60, 50, 200), 10)
+	if err := ingestStreams(r, 1, msgs); err != nil {
+		t.Fatal(err)
+	}
+	if e.disk.Used() != 0 {
+		t.Fatalf("%d bytes on disk before the Join", e.disk.Used())
 	}
 	sealed, err := r.Seal()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// An output batch that fits only once the other run is spilled, which
+	// the disk can't hold a byte of.
+	room := e.pool.Limit() - e.pool.Used() + e.pool.Idle()
+	e.m.cfg.OutputBatchBytes = room + other.buf.SpillSize()/2
 	if _, err := joinRun(r); !errors.Is(err, spill.ErrDiskExhausted) {
 		t.Fatalf("Join: %v, want ErrDiskExhausted", err)
 	}
@@ -307,10 +375,12 @@ func TestRun_DISK_EXHAUSTED_during_a_Join_leaves_the_run_SEALED(t *testing.T) {
 		t.Errorf("Seal after the failed Join: %v, %v; want the run still SEALED", again, err)
 	}
 
-	// With the other run gone, the same Join fits.
+	// With the other run gone, a Join with the usual batches fits, from
+	// memory.
 	if err := e.m.Delete(otherID); err != nil {
 		t.Fatal(err)
 	}
+	e.m.cfg.OutputBatchBytes = 4096
 	got, err := joinRun(r)
 	if err != nil {
 		t.Fatalf("Join after deleting the other run: %v", err)
@@ -320,48 +390,18 @@ func TestRun_DISK_EXHAUSTED_during_a_Join_leaves_the_run_SEALED(t *testing.T) {
 	}
 }
 
-// TestRun_Join_reads_its_buffers_where_they_are joins a run whose records
-// fit in memory with their index and the output batch, but not twice over.
-// The disk can't hold a byte, so the Join must not spill the buffers it is
-// about to read.
-func TestRun_Join_reads_its_buffers_where_they_are(t *testing.T) {
-	e := newEnvWithDisk(t, 64<<10, 1)
-	// A unit takes the whole budget, so that the bucket isn't oversized,
-	// which sub-partitioning would need the disk for.
-	e.m.cfg.JoinParallelism = 1
-	_, r := e.create(t, 1)
-	msgs, records := messages(randomRecords(rand.New(rand.NewPCG(7, 7)), 270, 50, 200), 10)
-	if err := ingestStreams(r, 1, msgs); err != nil {
-		t.Fatal(err)
-	}
-	size := r.parts.Bucket(buffer.Left, 0).Bytes() + r.parts.Bucket(buffer.Right, 0).Bytes()
-	if used := e.pool.Used(); e.disk.Used() != 0 || used+size <= e.pool.Limit() || size*join.ExpansionFactor > e.pool.Limit() {
-		t.Fatalf("%d bytes reserved, %d of records, %d on disk: want the records in memory, too many to load a copy, and within a unit's budget",
-			used, size, e.disk.Used())
-	}
-	if _, err := r.Seal(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := joinRun(r)
-	if err != nil {
-		t.Fatalf("Join: %v", err)
-	}
-	if d := oracle.Diff(oracle.Join(records), got); d != "" {
-		t.Error(d)
-	}
-	if files := spillFiles(t, r.dir); len(files) != 0 {
-		t.Errorf("spill files after the Join: %v", files)
-	}
-}
-
-// TestRun_concurrent_runs_spill_one_another ingests three runs at once,
-// and then joins them one at a time: the unit budget is the pool's share of
-// one Join's workers, so Joins of several runs at once may not fit.
+// TestRun_concurrent_runs_spill_one_another ingests and seals three runs
+// at once, and then joins them one at a time.
 func TestRun_concurrent_runs_spill_one_another(t *testing.T) {
 	e := newEnv(t, 512<<10)
+	type sealed struct {
+		id      string
+		r       *Run
+		records []oracle.Record
+	}
+	runs := make([]sealed, 3)
 	var wg sync.WaitGroup
-	var joins sync.Mutex
-	for i := range 3 {
+	for i := range runs {
 		wg.Go(func() {
 			id, err := e.m.Create(uint32(8 << i))
 			if err != nil {
@@ -384,35 +424,37 @@ func TestRun_concurrent_runs_spill_one_another(t *testing.T) {
 			}
 			streams.Wait()
 			if _, err := r.Seal(); err != nil {
-				t.Error(err)
+				t.Errorf("run %d: Seal: %v", i, err)
 				return
 			}
-			joins.Lock()
-			got, err := joinRun(r)
-			joins.Unlock()
-			if err != nil {
-				t.Errorf("run %d: Join: %v", i, err)
-				return
-			}
-			if d := oracle.Diff(oracle.Join(records), got); d != "" {
-				t.Errorf("run %d: %s", i, d)
-			}
-			if err := e.m.Delete(id); err != nil {
-				t.Error(err)
-			}
+			runs[i] = sealed{id, r, records}
 		})
 	}
 	wg.Wait()
-	if e.disk.Used() != 0 || e.pool.Used() != 0 {
-		t.Errorf("after every Delete: %d bytes on disk, %d reserved", e.disk.Used(), e.pool.Used())
+	if t.Failed() {
+		t.FailNow()
+	}
+	for i, run := range runs {
+		got, err := joinRun(run.r)
+		if err != nil {
+			t.Fatalf("run %d: Join: %v", i, err)
+		}
+		if d := oracle.Diff(oracle.Join(run.records), got); d != "" {
+			t.Errorf("run %d: %s", i, d)
+		}
+		if err := e.m.Delete(run.id); err != nil {
+			t.Error(err)
+		}
+	}
+	if e.disk.Used() != 0 || e.inUse() != 0 {
+		t.Errorf("after every Delete: %d bytes on disk, %d reserved", e.disk.Used(), e.inUse())
 	}
 }
 
 // TestRun_concurrent_Joins_share_the_pool joins three sealed runs at once.
-// Each Join plans its units for the whole pool, so Joins of several runs at
-// once may not fit (§15 sizes join memory for one Join): a Join that fails
-// must fail with ErrExhausted and leave its run SEALED, and joining it again
-// on its own must match the oracle.
+// Each Join sizes its read buffers from what the pool has free, so Joins
+// of several runs at once read with smaller buffers: they must all match
+// the oracle, or fail with ErrExhausted and leave the run SEALED.
 func TestRun_concurrent_Joins_share_the_pool(t *testing.T) {
 	e := newEnv(t, 512<<10)
 	type joined struct {
@@ -466,8 +508,132 @@ func TestRun_concurrent_Joins_share_the_pool(t *testing.T) {
 		}
 	}
 	t.Logf("%d of %d concurrent Joins ran out of memory", exhausted, len(runs))
-	if e.disk.Used() != 0 || e.pool.Used() != 0 {
-		t.Errorf("after every Delete: %d bytes on disk, %d reserved", e.disk.Used(), e.pool.Used())
+	if e.disk.Used() != 0 || e.inUse() != 0 {
+		t.Errorf("after every Delete: %d bytes on disk, %d reserved", e.disk.Used(), e.inUse())
+	}
+}
+
+// TestRun_Delete_during_a_Join_of_files deletes a run whose Join is
+// stuck in a send: Delete doesn't wait for it, the Join ends with
+// ErrAborted once the send returns, and frees the run's memory.
+func TestRun_Delete_during_a_Join_of_files(t *testing.T) {
+	e := newEnv(t, 256<<10)
+	id, r := e.create(t, 4)
+	msgs, _ := messages(randomRecords(rand.New(rand.NewPCG(8, 8)), 10_000, 2000, 100), 100)
+	if err := ingestStreams(r, 2, msgs); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	stuck := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	var once sync.Once
+	go func() {
+		done <- r.Join(context.Background(), join.NewFilter(nil), func(*reconv1.JoinResponse) error {
+			once.Do(func() { close(stuck) })
+			<-release
+			return nil
+		})
+	}()
+	<-stuck
+	deleted := make(chan error, 1)
+	go func() { deleted <- e.m.Delete(id) }()
+	select {
+	case err := <-deleted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Delete waits for a Join stuck in a send")
+	}
+	if _, err := os.Stat(r.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("run directory after Delete: %v", err)
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, ErrAborted) {
+		t.Errorf("Join: %v, want ErrAborted", err)
+	}
+	if e.inUse() != 0 || e.disk.Used() != 0 {
+		t.Errorf("after the Join ended: %d bytes reserved, %d on disk", e.inUse(), e.disk.Used())
+	}
+}
+
+// TestRun_Seal_merges_files_a_Join_couldnt_read_at_once ingests 20 times
+// a small budget, so that the run has more files than one worker reads
+// with read buffers of 16 KiB.
+func TestRun_Seal_merges_files_a_Join_couldnt_read_at_once(t *testing.T) {
+	e := newEnv(t, 512<<10)
+	logs := &recorder{}
+	e.m.log = slog.New(logs)
+	_, r := e.create(t, 4)
+	msgs, records := messages(randomRecords(rand.New(rand.NewPCG(9, 9)), 100_000, 20_000, 200), 100)
+	if err := ingestStreams(r, 2, msgs); err != nil {
+		t.Fatal(err)
+	}
+	before := len(r.buf.Files())
+	if _, err := r.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	sealed := logs.find("run sealed")
+	if len(sealed) != 1 || sealed[0]["recon.merges"].Int64() == 0 || int(sealed[0]["recon.run_files"].Int64()) >= before {
+		t.Fatalf("run sealed record %v after %d spills, want merges down to fewer files", sealed, before)
+	}
+	if names := runFileNames(t, r.dir); len(names) != len(r.buf.Files()) {
+		t.Errorf("%d files in the directory, the run has %d: merged files must be removed", len(names), len(r.buf.Files()))
+	}
+	var size int64
+	for _, f := range r.buf.Files() {
+		size += f.Bytes
+	}
+	if e.disk.Used() != size {
+		t.Errorf("%d bytes on disk, the run's files have %d", e.disk.Used(), size)
+	}
+	got, err := joinRun(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := oracle.Diff(oracle.Join(records), got); d != "" {
+		t.Error(d)
+	}
+	t.Logf("%d files merged to %d in %d merges", before, len(r.buf.Files()), sealed[0]["recon.merges"].Int64())
+}
+
+// TestRun_Delete_during_Seal cancels Seal's merge.
+func TestRun_Delete_during_Seal(t *testing.T) {
+	e := newEnv(t, 512<<10)
+	id, r := e.create(t, 4)
+	msgs, _ := messages(randomRecords(rand.New(rand.NewPCG(10, 9)), 100_000, 20_000, 200), 100)
+	if err := ingestStreams(r, 2, msgs); err != nil {
+		t.Fatal(err)
+	}
+	sealed := make(chan error, 1)
+	go func() {
+		_, err := r.Seal()
+		sealed <- err
+	}()
+	for {
+		r.mu.Lock()
+		sealing := r.sealing
+		r.mu.Unlock()
+		if sealing {
+			break
+		}
+		runtime.Gosched()
+	}
+	if err := e.m.Delete(id); err != nil {
+		t.Fatal(err)
+	}
+	err := <-sealed
+	if err != nil && reason(err) != reconv1.ErrorReason_ERROR_REASON_RUN_NOT_FOUND {
+		t.Errorf("Seal of a deleted run: %v, want nil or RUN_NOT_FOUND", err)
+	}
+	if e.inUse() != 0 || e.disk.Used() != 0 {
+		t.Errorf("after Delete: %d bytes reserved, %d on disk", e.inUse(), e.disk.Used())
+	}
+	if _, err := os.Stat(r.dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("run directory after Delete: %v", err)
 	}
 }
 
@@ -476,7 +642,7 @@ func TestRun_concurrent_Joins_share_the_pool(t *testing.T) {
 // budget.
 func genRecords(t *rapid.T) []oracle.Record {
 	keys := rapid.SliceOfN(rapid.SliceOfN(rapid.Byte(), 0, 12), 1, 200).Draw(t, "keys")
-	n := rapid.IntRange(0, 1500).Draw(t, "records")
+	n := rapid.IntRange(0, 4000).Draw(t, "records")
 	records := make([]oracle.Record, n)
 	side := oracle.Side(rapid.IntRange(0, 1).Draw(t, "first side"))
 	for i := range records {
@@ -495,207 +661,59 @@ func genRecords(t *rapid.T) []oracle.Record {
 	return records
 }
 
-// overFloor is the unit budget that sub-partitioning genRecords' records
-// takes at most: half of it for a sub-unit's records, an index entry for
-// each of at most 1500 records, an output batch of at most 4 KiB, a read
-// buffer of a sixteenth of it, and the scan's counters or the write
-// buffers, each within half of it.
-const overFloor = 64 << 10
-
-// minBudget returns the smallest budget the run can always be ingested
-// and joined in by one worker, however its buffers are spilled. Below it, a
-// message and its next chunk wouldn't fit even with everything else
-// spilled, or a join unit wouldn't, or, if a bucket exceeds the unit
-// budget, the unit budget would be under overFloor. The plan depends on the
-// budget, so it is found by raising the budget until it holds.
-func minBudget(records []oracle.Record, msgs []message, n uint32, parallelism int, batch, from int64) int64 {
-	sizes := make([]int64, n)
-	counts := make([]int64, n)
-	var maxMsg int64
-	for _, r := range records {
-		if len(r.Key) == 0 {
+// firstHotKey returns the Match of results larger than maxMatch that comes
+// first in the plan: the lowest hash, then key.
+func firstHotKey(results []*reconv1.JoinResult, maxMatch int64) *reconv1.Match {
+	var first *reconv1.Match
+	for _, r := range results {
+		m := r.GetBoth()
+		if m == nil || int64(proto.Size(m)) <= maxMatch {
 			continue
 		}
-		b := buffer.Hash(r.Key) % uint64(n)
-		sizes[b] += int64(buffer.EncodedLen(r.Key, r.Value))
-		counts[b]++
-	}
-	for _, m := range msgs {
-		maxMsg = max(maxMsg, m.size)
-	}
-	budget := max(from, 2*(maxMsg+max(4096, maxRecord(records))))
-	for {
-		need := int64(0)
-		unit := budget / int64(parallelism)
-		for _, u := range join.Plan(sizes, unit) {
-			if u.Hi-u.Lo == 1 && sizes[u.Lo]*join.ExpansionFactor > unit {
-				need = max(need, int64(parallelism)*overFloor)
-				continue
-			}
-			var load int64
-			for b := u.Lo; b < u.Hi; b++ {
-				load += sizes[b] + counts[b]*16
-			}
-			need = max(need, batch+load)
+		if first == nil || cmp.Or(cmp.Compare(record.Hash(m.GetKey()), record.Hash(first.GetKey())), bytes.Compare(m.GetKey(), first.GetKey())) < 0 {
+			first = m
 		}
-		if need <= budget {
-			return budget
-		}
-		budget = need
 	}
+	return first
 }
 
-func maxRecord(records []oracle.Record) int64 {
-	var n int64
-	for _, r := range records {
-		n = max(n, int64(buffer.EncodedLen(r.Key, r.Value)))
-	}
-	return n
-}
-
-// parallelNeed returns the most the Join of r, sealed in a pool of limit,
-// takes with several workers, which join units at once: their output
-// batches, and the most that as many units take together, since a unit
-// that is loading can't spill what the others have pinned. A unit takes an
-// index entry per record and its buffers' chunks at their capacity or
-// their spill files read back, an oversized bucket its chunks and a unit
-// budget, and the empty-key unit its chunks, a read buffer and a record.
-// Spilling during the Join only turns chunks into smaller files, so the
-// buffers as they are after Seal bound it. With one worker, minBudget's
-// bound holds, and it returns 0.
-func parallelNeed(r *Run, limit int64, parallelism int, batch, maxRecord int64) int64 {
-	if parallelism == 1 {
-		return 0
-	}
-	held := func(b *buffer.Buffer, files bool) int64 {
-		var n int64
-		for _, c := range b.Chunks() {
-			n += int64(cap(c))
-		}
-		if files {
-			for _, f := range b.Files() {
-				n += f.Bytes
-			}
-		}
-		return n
-	}
-	p := r.parts
-	unit := limit / int64(parallelism)
-	sizes := make([]int64, p.Buckets())
-	for i := range sizes {
-		sizes[i] = p.Bucket(buffer.Left, uint32(i)).Bytes() + p.Bucket(buffer.Right, uint32(i)).Bytes()
-	}
-	var peaks []int64
-	for _, u := range join.Plan(sizes, unit) {
-		if u.Hi-u.Lo == 1 && sizes[u.Lo]*join.ExpansionFactor > unit {
-			peaks = append(peaks, unit+held(p.Bucket(buffer.Left, u.Lo), false)+held(p.Bucket(buffer.Right, u.Lo), false))
-			continue
-		}
-		var peak int64
-		for i := u.Lo; i < u.Hi; i++ {
-			for s := range 2 {
-				b := p.Bucket(buffer.Side(s), i)
-				peak += held(b, true) + b.Records()*16
-			}
-		}
-		peaks = append(peaks, peak)
-	}
-	if p.Empty(buffer.Left).Records()+p.Empty(buffer.Right).Records() > 0 {
-		read := min(max(unit/16, 512), 1<<20)
-		peaks = append(peaks, held(p.Empty(buffer.Left), false)+held(p.Empty(buffer.Right), false)+read+maxRecord)
-	}
-	slices.SortFunc(peaks, func(a, b int64) int { return cmp.Compare(b, a) })
-	workers := min(parallelism, len(peaks))
-	need := int64(workers) * batch
-	for _, peak := range peaks[:workers] {
-		need += peak
-	}
-	return need
-}
-
-// hotKeys returns the per-side counts of the keys of records whose bytes
-// take more than the unit budget.
-func hotKeys(records []oracle.Record, unit int64) map[string][2]uint64 {
-	type stats struct {
-		counts [2]uint64
-		bytes  int64
-	}
-	all := map[string]*stats{}
-	for _, r := range records {
-		if len(r.Key) == 0 {
-			continue
-		}
-		s := all[string(r.Key)]
-		if s == nil {
-			s = &stats{}
-			all[string(r.Key)] = s
-		}
-		s.counts[r.Side]++
-		s.bytes += int64(buffer.EncodedLen(r.Key, r.Value))
-	}
-	hot := map[string][2]uint64{}
-	for k, s := range all {
-		if s.bytes*join.ExpansionFactor > unit {
-			hot[k] = s.counts
-		}
-	}
-	return hot
-}
-
+// TestRun_property_tiny_budgets_spill_and_match_the_oracle ingests on
+// several streams under budgets from 128 KiB, joins with up to four
+// workers, and checks the results against the oracle: HOT_KEY exactly when
+// a Match is over the maximum, and the first such key in the plan.
 func TestRun_property_tiny_budgets_spill_and_match_the_oracle(t *testing.T) {
 	h := humustest.NewHost(t, humustest.WithFiles(map[string][]byte{"data/.keep": nil}))
 	var examples, spilled, hot int
-	var spilledBy [5]int // examples that spilled, by parallelism
-	subpartitioned := &counter{msg: "bucket sub-partitioned"}
 	rapid.Check(t, func(rt *rapid.T) {
 		examples++
 		records := genRecords(rt)
-		n := uint32(rapid.IntRange(1, 64).Draw(rt, "buckets"))
 		parallelism := rapid.IntRange(1, 4).Draw(rt, "parallelism")
 		batch := rapid.Int64Range(64, 4096).Draw(rt, "batch")
 		msgs, _ := messages(records, rapid.IntRange(1, 60).Draw(rt, "per message"))
 		streams := rapid.IntRange(1, 3).Draw(rt, "streams")
-		limit := minBudget(records, msgs, n, parallelism, batch, rapid.Int64Range(1, 1<<20).Draw(rt, "budget"))
-
-		// With several workers, the budget is raised until the units that
-		// may run at once fit, as the buffers turned out, and the run is
-		// ingested again.
-		var m *Manager
-		var r *Run
-		var id string
-		var pool *mem.Pool
-		var disk *spill.Disk
-		for attempt := 0; ; attempt++ {
-			pool = mem.NewPool(limit)
-			disk = spill.NewDisk(h.FS(), 1<<30)
-			m = NewManager(h.FS(), pool, disk, Config{
-				DataDir:          h.Path(fmt.Sprintf("data/%d-%d", examples, attempt)),
-				MaxRuns:          1,
-				MaxBuckets:       64,
-				OutputBatchBytes: batch,
-				JoinParallelism:  parallelism,
-				Logger:           slog.New(subpartitioned),
-			})
-			var err error
-			if id, err = m.Create(n); err != nil {
-				rt.Fatal(err)
-			}
-			r, _ = m.Get(id)
-			if err := ingestStreams(r, streams, msgs); err != nil {
-				rt.Fatalf("Ingest with a %d-byte budget: %v", limit, err)
-			}
-			need := parallelNeed(r, limit, parallelism, batch, maxRecord(records))
-			if need <= limit {
-				break
-			}
-			if err := m.Delete(id); err != nil {
-				rt.Fatal(err)
-			}
-			limit = minBudget(records, msgs, n, parallelism, batch, need)
+		limit := rapid.Int64Range(128<<10, 512<<10).Draw(rt, "budget")
+		pool := mem.NewPool(limit)
+		disk := spill.NewDisk(h.FS(), 1<<30)
+		m, err := NewManager(h.FS(), pool, disk, Config{
+			DataDir:          h.Path(fmt.Sprintf("data/%d", examples)),
+			MaxRuns:          1,
+			MaxBuckets:       64,
+			OutputBatchBytes: batch,
+			JoinParallelism:  parallelism,
+		})
+		if err != nil {
+			rt.Fatal(err)
+		}
+		id, err := m.Create(uint32(rapid.IntRange(1, 64).Draw(rt, "buckets")))
+		if err != nil {
+			rt.Fatal(err)
+		}
+		r, _ := m.Get(id)
+		if err := ingestStreams(r, streams, msgs); err != nil {
+			rt.Fatalf("Ingest with a %d-byte budget: %v", limit, err)
 		}
 		if disk.Used() > 0 {
 			spilled++
-			spilledBy[parallelism]++
 		}
 		sealed, err := r.Seal()
 		if err != nil {
@@ -704,46 +722,119 @@ func TestRun_property_tiny_budgets_spill_and_match_the_oracle(t *testing.T) {
 		if got := sealed.GetLeft().GetRecords() + sealed.GetRight().GetRecords(); got != uint64(len(records)) {
 			rt.Fatalf("sealed %d records, ingested %d", got, len(records))
 		}
+		want := oracle.Join(records)
+		maxMatch := join.MaxMatch(limit, r.joinOptions(join.Filter{}, [2]uint64{}))
 		got, err := joinRun(r)
-		if want := hotKeys(records, limit/int64(parallelism)); len(want) > 0 {
+		if hk := firstHotKey(want, maxMatch); hk != nil {
 			hot++
-			hk, ok := errors.AsType[*join.HotKeyError](err)
-			if !ok {
-				rt.Fatalf("Join with a %d-byte budget: %v, want a HotKeyError naming one of %d hot keys", limit, err, len(want))
-			}
-			if counts, ok := want[string(hk.Key)]; !ok || counts != [2]uint64{hk.Left, hk.Right} {
-				rt.Fatalf("HotKeyError for key %q with %d left and %d right records; it is hot: %v, with %v", hk.Key, hk.Left, hk.Right, ok, counts)
-			}
-			if again, err := r.Seal(); err != nil || again != sealed {
-				rt.Fatalf("Seal after HOT_KEY: %v, %v; want the run still SEALED", again, err)
-			}
-			_, err = joinRun(r)
-			if hk2, ok := errors.AsType[*join.HotKeyError](err); !ok || !bytes.Equal(hk2.Key, hk.Key) || hk2.Error() != hk.Error() {
-				rt.Fatalf("the second Join: %v, the first: %v; want the same HOT_KEY", err, hk)
+			for range 2 {
+				he, ok := errors.AsType[*join.HotKeyError](err)
+				if !ok || !bytes.Equal(he.Key, hk.GetKey()) || he.Left != uint64(len(hk.GetLeft())) || he.Right != uint64(len(hk.GetRight())) {
+					rt.Fatalf("Join with a %d-byte budget: %v, want HOT_KEY for %q with %d and %d records", limit, err, hk.GetKey(), len(hk.GetLeft()), len(hk.GetRight()))
+				}
+				if again, err := r.Seal(); err != nil || again != sealed {
+					rt.Fatalf("Seal after HOT_KEY: %v, %v; want the run still SEALED", again, err)
+				}
+				_, err = joinRun(r)
 			}
 		} else {
 			if err != nil {
 				rt.Fatalf("Join with a %d-byte budget: %v", limit, err)
 			}
-			if d := oracle.Diff(oracle.Join(records), got); d != "" {
+			if d := oracle.Diff(want, got); d != "" {
 				rt.Fatal(d)
 			}
+		}
+		if pool.Peak() > pool.Limit() {
+			rt.Fatalf("pool peak %d above its limit", pool.Peak())
 		}
 		if err := m.Delete(id); err != nil {
 			rt.Fatal(err)
 		}
-		if pool.Used() != 0 || disk.Used() != 0 {
-			rt.Fatalf("after Delete: %d bytes reserved, %d on disk", pool.Used(), disk.Used())
+		if pool.Used()-pool.Idle() != m.reserved || disk.Used() != 0 {
+			rt.Fatalf("after Delete: %d bytes reserved, %d on disk", pool.Used()-pool.Idle()-m.reserved, disk.Used())
 		}
 	})
-	if spilledBy[1] == 0 || spilled == spilledBy[1] || hot == examples {
-		t.Errorf("of %d examples, %d spilled (by parallelism 1 to 4: %v) and %d had a hot key; want some to spill with one worker and with more, and some without a hot key",
-			examples, spilled, spilledBy[1:], hot)
+	if spilled == 0 || hot == examples || hot == 0 {
+		t.Errorf("of %d examples, %d spilled and %d had a hot key; want some to spill, some with a hot key and some without", examples, spilled, hot)
 	}
-	// Few examples have a bucket of over 32 KiB, so sub-partitioning is
-	// left to package join's property test to assert.
-	t.Logf("%d of %d examples spilled (by parallelism 1 to 4: %v), %d had a hot key; %d sub-partitionings",
-		spilled, examples, spilledBy[1:], hot, subpartitioned.n.Load())
+	t.Logf("%d of %d examples spilled, %d had a hot key", spilled, examples, hot)
+}
+
+// TestRun_live_heap_stays_near_the_pool joins 64 MiB of records under an
+// 8 MiB budget and samples the live heap while it runs: what the Join
+// allocates is reserved, so the heap grows by about the budget, not the
+// data.
+func TestRun_live_heap_stays_near_the_pool(t *testing.T) {
+	if testing.Short() {
+		t.Skip("joins 64 MiB")
+	}
+	e := newEnv(t, 8<<20)
+	_, r := e.create(t, 4)
+	rng := rand.New(rand.NewPCG(11, 11))
+	in, err := r.BeginIngest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left, right uint64
+	for sent := 0; sent < 64<<20; {
+		recs := randomRecords(rng, 500, 200_000, 250)
+		msgs, _ := messages(recs, 500)
+		for _, m := range msgs {
+			if err := in.Append(m.side, m.records, m.size); err != nil {
+				t.Fatal(err)
+			}
+			sent += int(m.size)
+			if m.side == record.Left {
+				left += uint64(len(m.records))
+			} else {
+				right += uint64(len(m.records))
+			}
+		}
+	}
+	if err := in.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	// Idle blocks are reserved, live memory, which the Join takes over:
+	// drop them, so that the heap grows by what the Join adds.
+	e.pool.DropIdle()
+	defer debug.SetGCPercent(debug.SetGCPercent(10))
+	runtime.GC()
+	sample := []metrics.Sample{{Name: "/gc/heap/live:bytes"}}
+	metrics.Read(sample)
+	base := int64(sample[0].Value.Uint64())
+	var peak atomic.Int64
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Millisecond):
+				metrics.Read(sample)
+				if v := int64(sample[0].Value.Uint64()); v > peak.Load() {
+					peak.Store(v)
+				}
+			}
+		}
+	}()
+	var results uint64
+	err = r.Join(t.Context(), join.NewFilter(nil), func(resp *reconv1.JoinResponse) error {
+		results += uint64(len(resp.GetResults()))
+		return nil
+	})
+	close(done)
+	if err != nil {
+		t.Fatal(err)
+	}
+	growth := peak.Load() - base
+	t.Logf("live heap grew by %d MiB over %d MiB during the Join of %d records, %d results, pool peak %d MiB", growth>>20, base>>20, left+right, results, e.pool.Peak()>>20)
+	if growth > 2*e.pool.Limit() {
+		t.Errorf("the live heap grew by %d bytes during the Join, more than twice the %d-byte budget", growth, e.pool.Limit())
+	}
 }
 
 // recorder keeps the attributes of every log record, by message.
@@ -775,21 +866,4 @@ func (h *recorder) find(msg string) []map[string]slog.Value {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.recs[msg]
-}
-
-// counter counts the log records with message msg.
-type counter struct {
-	msg string
-	n   atomic.Int64
-}
-
-func (c *counter) Enabled(context.Context, slog.Level) bool { return true }
-func (c *counter) WithAttrs([]slog.Attr) slog.Handler       { return c }
-func (c *counter) WithGroup(string) slog.Handler            { return c }
-
-func (c *counter) Handle(_ context.Context, r slog.Record) error {
-	if r.Message == c.msg {
-		c.n.Add(1)
-	}
-	return nil
 }

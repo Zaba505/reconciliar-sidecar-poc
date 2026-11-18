@@ -54,7 +54,9 @@ type ReconcilerClient interface {
 	// were accepted fails the run.
 	Ingest(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[IngestRequest, IngestResponse], error)
 	// Ends ingest for both sides and returns control totals. This is the only
-	// point where the sides are synchronized. Idempotent.
+	// point where the sides are synchronized. Idempotent. A run that spilled
+	// writes its last records to disk here; if that fails, with DISK_EXHAUSTED
+	// say, the run stays open with every record, and SealRun may be retried.
 	SealRun(ctx context.Context, in *SealRunRequest, opts ...grpc.CallOption) (*SealRunResponse, error)
 	// Streams the full outer join of a sealed run, in no particular order. The
 	// join is complete only when the stream closes with OK. Read-only and
@@ -149,7 +151,9 @@ type ReconcilerServer interface {
 	// were accepted fails the run.
 	Ingest(grpc.ClientStreamingServer[IngestRequest, IngestResponse]) error
 	// Ends ingest for both sides and returns control totals. This is the only
-	// point where the sides are synchronized. Idempotent.
+	// point where the sides are synchronized. Idempotent. A run that spilled
+	// writes its last records to disk here; if that fails, with DISK_EXHAUSTED
+	// say, the run stays open with every record, and SealRun may be retried.
 	SealRun(context.Context, *SealRunRequest) (*SealRunResponse, error)
 	// Streams the full outer join of a sealed run, in no particular order. The
 	// join is complete only when the stream closes with OK. Read-only and

@@ -14,9 +14,9 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	reconv1 "poc/gen/recon/v1"
-	"poc/internal/buffer"
 	"poc/internal/join"
 	"poc/internal/mem"
+	"poc/internal/record"
 	"poc/internal/run"
 	"poc/internal/spill"
 )
@@ -134,12 +134,12 @@ func (s *Server) ingest(stream grpc.ClientStreamingServer[reconv1.IngestRequest,
 }
 
 // batchOf returns the side and records of an IngestRequest.
-func batchOf(msg *reconv1.IngestRequest) (buffer.Side, *reconv1.RecordBatch, error) {
+func batchOf(msg *reconv1.IngestRequest) (record.Side, *reconv1.RecordBatch, error) {
 	switch b := msg.GetBatch().(type) {
 	case *reconv1.IngestRequest_Left:
-		return buffer.Left, b.Left, nil
+		return record.Left, b.Left, nil
 	case *reconv1.IngestRequest_Right:
-		return buffer.Right, b.Right, nil
+		return record.Right, b.Right, nil
 	default:
 		return 0, nil, invalid("an IngestRequest must set left or right")
 	}

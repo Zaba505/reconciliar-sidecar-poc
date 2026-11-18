@@ -506,12 +506,12 @@ func TestAPI_memory_exhausted(t *testing.T) {
 	})
 }
 
-// spillFiles counts the .rec files under dir.
+// spillFiles counts the run files under dir.
 func spillFiles(t *testing.T, dir string) int {
 	t.Helper()
 	var n int
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err == nil && strings.HasSuffix(path, ".rec") {
+		if err == nil && strings.HasSuffix(path, ".run") {
 			n++
 		}
 		return err
@@ -524,9 +524,7 @@ func spillFiles(t *testing.T, dir string) int {
 
 func TestAPI_ingest_past_the_budget_spills(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// One join unit takes the whole budget, which a key's 8 KiB of
-		// records then fit, not a quarter.
-		a := startApp(t, map[string]string{"RECON_MEMORY_LIMIT_BYTES": "64KiB", "RECON_OUTPUT_BATCH_BYTES": "4KiB", "RECON_JOIN_PARALLELISM": "1"})
+		a := startApp(t, map[string]string{"RECON_MEMORY_LIMIT_BYTES": "128KiB", "RECON_OUTPUT_BATCH_BYTES": "4KiB", "RECON_JOIN_PARALLELISM": "1"})
 		defer a.stop(t)
 		ctx := t.Context()
 		id := a.create(t, 16)
@@ -535,7 +533,7 @@ func TestAPI_ingest_past_the_budget_spills(t *testing.T) {
 			records = append(records, oracle.Record{Side: oracle.Side(i / 10 % 2), Key: fmt.Appendf(nil, "%d", i%60), Value: make([]byte, 2<<10)})
 		}
 		if err := a.ingest(ctx, batches(id, records, 4)...); err != nil {
-			t.Fatalf("Ingest of 400 KiB with a 64 KiB budget: %v", err)
+			t.Fatalf("Ingest of 400 KiB with a 128 KiB budget: %v", err)
 		}
 		if n := spillFiles(t, a.runDir(id)); n == 0 {
 			t.Fatal("no spill files after ingesting past the budget")
