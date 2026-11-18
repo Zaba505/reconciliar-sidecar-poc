@@ -338,6 +338,7 @@ The last phase writes `POC-RESULTS.md` with:
 - **Memory.** The pool's peak reservation against Go's peak heap (`runtime/metrics`, `/memory/classes/total:bytes`), both logged in the join-finished record. The gap between the two is the unaccounted memory that §19 lists as a risk. It is measured with `GOMEMLIMIT` unset and with it set to 90% of the container limit. These numbers feed §20 Q1.
 - **Join plan.** Files, workers, read buffer size, `pread` calls and batches, from the join-finished record, and spills and Seal's merges from the run-sealed record. These check PROPOSAL.md §8.4's sizing rule. (The bucket design's measurement here was its expansion factor, which sorted runs don't have.)
 - **Throughput.** Ingest, Seal and join throughput at 1 GiB and 10 GiB on this machine, plus run files, bytes on disk and the disk peak. These are a starting point for M3's targets, not targets themselves.
+- **Sizes.** A scenario's size (1 GiB, 10 GiB) is the key and value bytes of both sides together, and both sides get the same number of records. Sides of one profile split the bytes 50/50; with Payment on the left and BankLine on the right, the left holds 57% as protobuf (5.71 GiB against 4.28 GiB at 10 GiB), 59% as Avro and 60% as JSON.
 - **Against the bucket design**, on the same data and machine, from the bucket design's own measurements.
 
 ---
