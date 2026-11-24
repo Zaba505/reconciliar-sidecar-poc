@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"slices"
 	"testing"
+
+	"poc/internal/spill"
 )
 
 func TestReadSettings_defaults(t *testing.T) {
@@ -51,6 +53,9 @@ func TestReadSettings_defaults(t *testing.T) {
 	if cfg.LogKeys {
 		t.Error("LogKeys = true, want false")
 	}
+	if cfg.SpillCodec != spill.None {
+		t.Errorf("SpillCodec = %v, want none", cfg.SpillCodec)
+	}
 }
 
 func TestReadSettings_explicit_values(t *testing.T) {
@@ -66,6 +71,7 @@ func TestReadSettings_explicit_values(t *testing.T) {
 		"RECON_MAX_RECV_MESSAGE_BYTES": "4194304",
 		"RECON_OUTPUT_BATCH_BYTES":     "64KiB",
 		"RECON_MAX_MATCH_BYTES":        "5MiB",
+		"RECON_SPILL_CODEC":            "zstd",
 		"RECON_LOG_KEYS":               "true",
 	})), e.cgroup)
 	if err != nil {
@@ -82,6 +88,7 @@ func TestReadSettings_explicit_values(t *testing.T) {
 		MaxRecvMessageBytes: 4 << 20,
 		OutputBatchBytes:    64 << 10,
 		MaxMatchBytes:       5 << 20,
+		SpillCodec:          spill.Zstd,
 		LogKeys:             true,
 	}
 	if cfg.GRPC.Addr != ":7443" {
@@ -144,6 +151,8 @@ func TestReadSettings_rejects_a_bad_value(t *testing.T) {
 		{"output batch 0", map[string]string{"RECON_OUTPUT_BATCH_BYTES": "0B"}, "RECON_OUTPUT_BATCH_BYTES"},
 		{"max match negative", map[string]string{"RECON_MAX_MATCH_BYTES": "-1"}, "RECON_MAX_MATCH_BYTES"},
 		{"log keys not a bool", map[string]string{"RECON_LOG_KEYS": "maybe"}, "RECON_LOG_KEYS"},
+		{"spill codec unknown", map[string]string{"RECON_SPILL_CODEC": "lz4"}, "RECON_SPILL_CODEC"},
+		{"zstd under a small budget", map[string]string{"RECON_SPILL_CODEC": "zstd", "RECON_MEMORY_LIMIT_BYTES": "4MiB"}, "RECON_SPILL_CODEC"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

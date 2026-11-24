@@ -15,6 +15,8 @@ import (
 	"github.com/z5labs/humus/grpc/grpchealth"
 	"github.com/z5labs/humus/grpc/grpcserver"
 	"golang.org/x/sys/unix"
+
+	"poc/internal/spill"
 )
 
 // cgroupMemoryMax is the cgroup v2 file holding the container's memory limit.
@@ -26,17 +28,18 @@ type Settings struct {
 	// (RECON_TLS_CERT_FILE, RECON_TLS_KEY_FILE).
 	GRPC grpcserver.Settings
 
-	HealthAddr          string // RECON_HEALTH_ADDR
-	DataDir             string // RECON_DATA_DIR
-	MaxBuckets          uint32 // RECON_MAX_BUCKETS
-	MemoryLimit         int64  // RECON_MEMORY_LIMIT_BYTES
-	DiskLimit           int64  // RECON_DISK_LIMIT_BYTES; 0 until Init sets the default
-	JoinParallelism     int    // RECON_JOIN_PARALLELISM
-	MaxRuns             int    // RECON_MAX_RUNS
-	MaxRecvMessageBytes int    // RECON_MAX_RECV_MESSAGE_BYTES
-	OutputBatchBytes    int64  // RECON_OUTPUT_BATCH_BYTES
-	MaxMatchBytes       int64  // RECON_MAX_MATCH_BYTES
-	LogKeys             bool   // RECON_LOG_KEYS
+	HealthAddr          string      // RECON_HEALTH_ADDR
+	DataDir             string      // RECON_DATA_DIR
+	MaxBuckets          uint32      // RECON_MAX_BUCKETS
+	MemoryLimit         int64       // RECON_MEMORY_LIMIT_BYTES
+	DiskLimit           int64       // RECON_DISK_LIMIT_BYTES; 0 until Init sets the default
+	JoinParallelism     int         // RECON_JOIN_PARALLELISM
+	MaxRuns             int         // RECON_MAX_RUNS
+	MaxRecvMessageBytes int         // RECON_MAX_RECV_MESSAGE_BYTES
+	OutputBatchBytes    int64       // RECON_OUTPUT_BATCH_BYTES
+	MaxMatchBytes       int64       // RECON_MAX_MATCH_BYTES
+	SpillCodec          spill.Codec // RECON_SPILL_CODEC
+	LogKeys             bool        // RECON_LOG_KEYS
 }
 
 // readSettings reads Settings from s's environment. Every bad value is
@@ -51,7 +54,7 @@ func readSettings(ctx context.Context, s *humus.Setup, cgroupFile string) (Setti
 
 	cgroupLimit, hasCgroupLimit := readCgroupLimit(fsys, cgroupFile)
 
-	return config.Struct(func(r *config.Resolver) Settings {
+	cfg, err := config.Struct(func(r *config.Resolver) Settings {
 		return Settings{
 			GRPC: grpcserver.Settings{
 				Addr: r.Get(env("RECON_LISTEN").Default("127.0.0.1:7443").Validate(grpcserver.CheckAddr)),
@@ -82,9 +85,14 @@ func readSettings(ctx context.Context, s *humus.Setup, cgroupFile string) (Setti
 			MaxRecvMessageBytes: r.Get(bytesVar("RECON_MAX_RECV_MESSAGE_BYTES").Parse(toInt).Default(16 << 20).Validate(atLeastOne)),
 			OutputBatchBytes:    r.Get(bytesVar("RECON_OUTPUT_BATCH_BYTES").Default(1 << 20).Validate(atLeastOne)),
 			MaxMatchBytes:       r.Get(bytesVar("RECON_MAX_MATCH_BYTES").Default(3 << 20).Validate(atLeastOne)),
+			SpillCodec:          r.Get(env("RECON_SPILL_CODEC").Parse(spill.ParseCodec).Default(spill.None)),
 			LogKeys:             r.Get(env("RECON_LOG_KEYS").Parse(strconv.ParseBool).Default(false)),
 		}
 	}).Read(ctx)
+	if least := cfg.SpillCodec.MinLimit(); err == nil && cfg.MemoryLimit < least {
+		err = &config.Error{Name: "RECON_SPILL_CODEC", Err: fmt.Errorf("%v needs a memory limit of at least %d bytes, and RECON_MEMORY_LIMIT_BYTES is %d", cfg.SpillCodec, least, cfg.MemoryLimit)}
+	}
+	return cfg, err
 }
 
 // readCgroupLimit returns the memory limit in the cgroup's memory.max, and

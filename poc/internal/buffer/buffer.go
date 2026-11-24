@@ -79,7 +79,7 @@ type Buffer struct {
 // New returns an empty Buffer whose blocks reserve their memory from pool.
 func New(pool *mem.Pool) *Buffer {
 	b := &Buffer{pool: pool, blockSize: BlockSize(pool.Limit())}
-	if int64(b.blockSize)+blockOverhead < spill.FileBytes {
+	if int64(b.blockSize)+blockOverhead < spill.MaxFileBytes {
 		panic("buffer: a block holds less than a File")
 	}
 	return b
@@ -287,10 +287,10 @@ func (b *Buffer) Spill(write WriteFunc) error {
 
 	b.mu.Lock()
 	b.files = append(b.files, f)
-	b.meta += spill.FileBytes
+	b.meta += f.Mem()
 	b.mu.Unlock()
 	first := blocks[0]
-	b.pool.Release(first.reserved() - spill.FileBytes)
+	b.pool.Release(first.reserved() - f.Mem())
 	first.buf = nil
 	for _, blk := range blocks[1:] {
 		b.drop(blk)
@@ -345,8 +345,8 @@ func (b *Buffer) Replace(lo, hi int, f *spill.File) {
 	defer b.spillMu.Unlock()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	freed := spill.FilesMem(b.files[lo:hi]) - f.Mem()
 	b.files = slices.Replace(b.files, lo, hi, f)
-	freed := int64(hi-lo-1) * spill.FileBytes
 	b.meta -= freed
 	b.pool.Release(freed)
 }

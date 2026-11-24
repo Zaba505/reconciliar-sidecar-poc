@@ -17,11 +17,14 @@ import (
 // Files is where a merge writes a run's files: the run's directory, whose
 // deletion removes them.
 type Files interface {
+	// Format is the format of the files a merge writes.
+	Format() spill.Format
 	// Create reserves bytes on disk and creates a new run file, which buf
-	// is written through.
-	Create(bytes int64, buf []byte) (*spill.Writer, error)
-	// Unreserve gives back bytes Create reserved, for a file that wasn't
-	// written: the Writer removed it.
+	// is written through, in the format of enc.
+	Create(bytes int64, buf []byte, enc *spill.Encoder) (*spill.Writer, error)
+	// Unreserve gives back bytes Create reserved: all of them for a file
+	// that wasn't written, which the Writer removed, or those a file didn't
+	// take.
 	Unreserve(bytes int64)
 	// Remove removes files and gives back their bytes.
 	Remove(files []*spill.File)
@@ -36,7 +39,8 @@ type MergeStats struct {
 
 // Compact merges the run files of buf, which is sealed and in files only,
 // until a Join could read them all with one worker and read buffers of
-// mergeReadBuf bytes: the intermediate merge pass of an external sort. It
+// mergeReadBuf bytes, or of a block, if that is larger: the intermediate
+// merge pass of an external sort. It
 // merges the files next to each other whose bytes are fewest, so the order
 // of the files stays the ingest order.
 //
@@ -53,7 +57,7 @@ func Compact(ctx context.Context, pool *mem.Pool, fsys humus.FS, buf *buffer.Buf
 	for {
 		runs := buf.Files()
 		budget := readBudget(pool, 1, maxMatch, opts.OutputBatchBytes)
-		most := max(int(budget/mergeReadBuf), 2)
+		most := max(int(budget/int64(mergeBuffer(runs))), 2)
 		if len(runs) <= most {
 			return st, nil
 		}
@@ -88,26 +92,32 @@ func Compact(ctx context.Context, pool *mem.Pool, fsys humus.FS, buf *buffer.Buf
 	}
 }
 
+// mergeBuffer returns the read buffer Compact merges files down to.
+func mergeBuffer(files []*spill.File) int { return max(mergeReadBuf, spill.MinBuffer(files)) }
+
 // mergeFiles writes the records of runs to one new file, with read buffers
 // that take at most budget bytes.
 func mergeFiles(ctx context.Context, pool *mem.Pool, fsys humus.FS, files Files, runs []*spill.File, budget int64) (*spill.File, error) {
 	fan := len(runs)
 	bufSize := int(min(budget/int64(fan), maxReadBuf)) &^ (spill.Align - 1)
-	if bufSize < minReadBuf {
+	if least := max(minReadBuf, spill.MinBuffer(runs)); bufSize < least {
 		return nil, fmt.Errorf("%w: a merge of %d run files needs read buffers of %d bytes each, and may take %d bytes",
-			mem.ErrExhausted, fan, minReadBuf, budget)
+			mem.ErrExhausted, fan, least, budget)
 	}
+	format := files.Format()
 	writeSize := buffer.BlockSize(pool.Limit()) &^ (spill.Align - 1)
-	reserved := int64(fan)*int64(bufSize) + merge.Bytes(fan) + int64(fan)*sourceBytes + int64(writeSize) + spill.Align
+	reserved := int64(fan)*int64(bufSize) + merge.Bytes(fan) + int64(fan)*sourceBytes + int64(writeSize) + spill.Align +
+		spill.DecoderBytes(runs) + format.EncoderBytes()
 	if err := pool.Reserve(reserved); err != nil {
 		return nil, err
 	}
 	defer func() { pool.Release(reserved) }()
 
-	var bytes int64
+	var raw int64
 	for _, r := range runs {
-		bytes += r.Bytes
+		raw += r.Raw
 	}
+	bytes := format.MaxBytes(raw)
 	slab := make([]byte, fan*bufSize)
 	srcs := make([]merge.Source, fan)
 	grow := func(n int) ([]byte, error) {
@@ -118,10 +128,12 @@ func mergeFiles(ctx context.Context, pool *mem.Pool, fsys humus.FS, files Files,
 		return make([]byte, n), nil
 	}
 	var opened []*os.File
+	dec := spill.NewDecoder(runs)
 	defer func() {
 		for _, f := range opened {
 			_ = f.Close()
 		}
+		dec.Close()
 	}()
 	for i, r := range runs {
 		f, err := spill.Open(fsys, r)
@@ -129,7 +141,7 @@ func mergeFiles(ctx context.Context, pool *mem.Pool, fsys humus.FS, files Files,
 			return nil, err
 		}
 		opened = append(opened, f)
-		c := spill.NewCursor(f, uint64(i), slab[i*bufSize:(i+1)*bufSize:(i+1)*bufSize], grow)
+		c := spill.NewFileCursor(f, r, uint64(i), slab[i*bufSize:(i+1)*bufSize:(i+1)*bufSize], grow, dec)
 		if err := c.Reset(0, r.Bytes); err != nil {
 			return nil, err
 		}
@@ -138,7 +150,7 @@ func mergeFiles(ctx context.Context, pool *mem.Pool, fsys humus.FS, files Files,
 	m := merge.New(srcs)
 	m.Init()
 
-	w, err := files.Create(bytes, spill.AlignedBuffer(writeSize))
+	w, err := files.Create(bytes, spill.AlignedBuffer(writeSize), spill.NewEncoder(format))
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +164,8 @@ func mergeFiles(ctx context.Context, pool *mem.Pool, fsys humus.FS, files Files,
 		files.Unreserve(bytes)
 		return nil, err
 	}
-	if f.Bytes != bytes {
+	files.Unreserve(bytes - f.Bytes)
+	if f.Raw != raw {
 		files.Remove([]*spill.File{f})
 		return nil, errors.New("join: a merge wrote a different number of bytes than it read")
 	}

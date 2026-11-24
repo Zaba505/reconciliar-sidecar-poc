@@ -28,6 +28,16 @@ import (
 	"poc/internal/spill"
 )
 
+// testCodec is the codec env spills with: RECON_TEST_SPILL_CODEC's, so
+// that the package's tests can run on files of blocks, or none.
+var testCodec = func() spill.Codec {
+	c, err := spill.ParseCodec(cmp.Or(os.Getenv("RECON_TEST_SPILL_CODEC"), "none"))
+	if err != nil {
+		panic(err)
+	}
+	return c
+}()
+
 // env is a run's buffer, spilled to real files, below run.Manager.
 type env struct {
 	fsys  humus.FS
@@ -35,6 +45,7 @@ type env struct {
 	pool  *mem.Pool
 	buf   *buffer.Buffer
 	wbuf  []byte
+	enc   *spill.Encoder
 	seq   atomic.Int64
 	disk  atomic.Int64 // bytes of files
 	recs  []oracle.Record
@@ -53,8 +64,14 @@ func newEnv(t testing.TB, limit int64) *env {
 }
 
 func newEnvOn(fsys humus.FS, dir string, limit int64) *env {
+	return newEnvAs(fsys, dir, limit, testCodec)
+}
+
+// newEnvAs is newEnvOn, spilling with codec.
+func newEnvAs(fsys humus.FS, dir string, limit int64, codec spill.Codec) *env {
 	pool := mem.NewPool(limit)
-	e := &env{fsys: fsys, dir: dir, pool: pool, buf: buffer.New(pool), wbuf: spill.AlignedBuffer(buffer.BlockSize(limit) &^ (spill.Align - 1))}
+	e := &env{fsys: fsys, dir: dir, pool: pool, buf: buffer.New(pool), wbuf: spill.AlignedBuffer(buffer.BlockSize(limit) &^ (spill.Align - 1)),
+		enc: spill.NewEncoder(spill.FormatFor(codec, limit))}
 	e.spill.Store(true)
 	pool.SetSource(func() []mem.Spillable { return []mem.Spillable{(*envSpill)(e)} })
 	return e
@@ -71,7 +88,7 @@ func (s *envSpill) SpillSize() int64 {
 func (s *envSpill) Spill() error { return s.buf.Spill((*env)(s).write) }
 
 func (e *env) write(size int64, m *merge.Merger) (*spill.File, error) {
-	w, err := spill.Create(e.fsys, filepath.Join(e.dir, fmt.Sprintf("%06d.run", e.seq.Add(1))), e.wbuf)
+	w, err := spill.Create(e.fsys, filepath.Join(e.dir, fmt.Sprintf("%06d.run", e.seq.Add(1))), e.wbuf, e.enc)
 	if err != nil {
 		return nil, err
 	}
@@ -81,9 +98,20 @@ func (e *env) write(size int64, m *merge.Merger) (*spill.File, error) {
 	}
 	f, err := w.Finish()
 	if err == nil {
-		e.disk.Add(size)
+		if f.Raw != size {
+			return nil, fmt.Errorf("a spill of %d bytes wrote %d", size, f.Raw)
+		}
+		e.disk.Add(f.Bytes)
 	}
 	return f, err
+}
+
+// format is the format the env spills in.
+func (e *env) format() spill.Format {
+	if e.enc == nil {
+		return spill.Format{}
+	}
+	return e.enc.Format()
 }
 
 // ingest appends records, in messages of up to per records of one side.
@@ -216,7 +244,7 @@ func TestRun_joins_like_the_oracle_from_memory_files_or_both(t *testing.T) {
 				t.Fatal(d)
 			}
 			t.Logf("%d files, %d blocks, %d workers, %d tasks, %d batches, %d reads", st.Files, st.Blocks, st.Workers, st.Tasks, st.Batches, st.Reads)
-			if e.pool.Used() != e.pool.Idle()+int64(st.Files)*spill.FileBytes+e.blockBytes() {
+			if e.pool.Used() != e.pool.Idle()+spill.FilesMem(e.buf.Files())+e.blockBytes() {
 				t.Errorf("the Join left %d reserved", e.pool.Used()-e.pool.Idle())
 			}
 		})
@@ -433,7 +461,7 @@ func TestRun_stops_when_its_context_ends(t *testing.T) {
 	if sent > 3+4 {
 		t.Errorf("%d batches sent after the cancel, want at most one per worker", sent-3)
 	}
-	if e.pool.Used()-e.pool.Idle() != spill.FileBytes {
+	if e.pool.Used()-e.pool.Idle() != spill.FilesMem(e.buf.Files()) {
 		t.Errorf("%d reserved after the cancelled Join", e.pool.Used()-e.pool.Idle())
 	}
 
@@ -785,9 +813,11 @@ func TestRun_gives_up_workers_before_read_buffers_get_small(t *testing.T) {
 // files writes runs for Compact in the env's directory.
 type envFiles struct{ e *env }
 
-func (f envFiles) Create(size int64, buf []byte) (*spill.Writer, error) {
+func (f envFiles) Format() spill.Format { return f.e.format() }
+
+func (f envFiles) Create(size int64, buf []byte, enc *spill.Encoder) (*spill.Writer, error) {
 	f.e.disk.Add(size)
-	return spill.Create(f.e.fsys, filepath.Join(f.e.dir, fmt.Sprintf("%06d.run", f.e.seq.Add(1))), buf)
+	return spill.Create(f.e.fsys, filepath.Join(f.e.dir, fmt.Sprintf("%06d.run", f.e.seq.Add(1))), buf, enc)
 }
 
 func (f envFiles) Unreserve(size int64) { f.e.disk.Add(-size) }
@@ -806,25 +836,28 @@ func TestCompact_merges_files_until_one_worker_reads_them(t *testing.T) {
 	e.ingest(t, recs, 100)
 	e.seal(t)
 	before := len(e.buf.Files())
-	disk := e.disk.Load()
 	opts := e.options(2, 16<<10)
 	st, err := Compact(t.Context(), e.pool, e.fsys, e.buf, envFiles{e}, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	after := len(e.buf.Files())
-	most := int(readBudget(e.pool, 1, MaxMatch(e.pool.Limit(), opts), opts.OutputBatchBytes) / mergeReadBuf)
+	most := int(readBudget(e.pool, 1, MaxMatch(e.pool.Limit(), opts), opts.OutputBatchBytes) / int64(mergeBuffer(e.buf.Files())))
 	t.Logf("%d files merged to %d in %d merges of %d bytes", before, after, st.Merges, st.Bytes)
 	if st.Merges == 0 || after > max(most, 2) || after >= before {
 		t.Errorf("%d files merged to %d in %d merges; want at most %d", before, after, st.Merges, most)
 	}
+	var disk int64
+	for _, f := range e.buf.Files() {
+		disk += f.Bytes
+	}
 	if e.disk.Load() != disk {
-		t.Errorf("%d bytes of files after the merges, %d before", e.disk.Load(), disk)
+		t.Errorf("%d bytes of files reserved after the merges, which take %d", e.disk.Load(), disk)
 	}
 	if entries, _ := os.ReadDir(e.dir); len(entries) != after+1 { // and .keep
 		t.Errorf("%d entries in the run's directory, want its %d files", len(entries)-1, after)
 	}
-	if e.pool.Used()-e.pool.Idle() != int64(after)*spill.FileBytes {
+	if e.pool.Used()-e.pool.Idle() != spill.FilesMem(e.buf.Files()) {
 		t.Errorf("%d reserved after the merges, want the %d files' tables", e.pool.Used()-e.pool.Idle(), after)
 	}
 	batches, _, err := e.join(t.Context(), opts)

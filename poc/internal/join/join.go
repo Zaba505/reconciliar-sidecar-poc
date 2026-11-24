@@ -145,8 +145,9 @@ type Stats struct {
 	Files, Blocks  int // merged by each worker
 	Workers, Tasks int
 	ReadBuffer     int   // bytes of one cursor's read buffer
-	ReadBytes      int64 // reserved for read buffers
+	ReadBytes      int64 // reserved for read buffers, and to decode blocks
 	Reads          int64 // preads
+	BytesRead      int64 // by the preads
 	Batches        int64
 	Streamed       int64 // one-sided keys too large for a Match, streamed
 	MaxMatch       int64
@@ -215,9 +216,10 @@ func readBudget(pool *mem.Pool, workers int, maxMatch, batch int64) int64 {
 }
 
 // readBuffer returns the size of a read buffer when workers workers each
-// read files files.
-func readBuffer(pool *mem.Pool, workers, files int, maxMatch, batch int64) int {
-	return int(min(readBudget(pool, workers, maxMatch, batch)/int64(workers*files), maxReadBuf)) &^ (spill.Align - 1)
+// read files files, and each takes dec bytes besides to decode their
+// blocks.
+func readBuffer(pool *mem.Pool, workers, files int, dec, maxMatch, batch int64) int {
+	return int(min((readBudget(pool, workers, maxMatch, batch)-int64(workers)*dec)/int64(workers*files), maxReadBuf)) &^ (spill.Align - 1)
 }
 
 // Run streams the full outer join of buf, which is sealed, and sends the
@@ -276,7 +278,7 @@ func Run(ctx context.Context, pool *mem.Pool, fsys humus.FS, buf *buffer.Buffer,
 	var sizes [record.Fences]int64
 	for _, f := range files {
 		for i := range sizes {
-			sizes[i] += f.Fences[i+1] - f.Fences[i]
+			sizes[i] += f.RawSize(i)
 		}
 	}
 	snap.AddFenceBytes(&sizes)
@@ -290,15 +292,17 @@ func Run(ctx context.Context, pool *mem.Pool, fsys humus.FS, buf *buffer.Buffer,
 		}
 	}()
 	if len(files) > 0 && workers > 0 {
-		for workers > 1 && readBuffer(pool, workers, len(files), maxMatch, batch) < goodReadBuf {
+		least := max(minReadBuf, spill.MinBuffer(files))
+		dec := spill.DecoderBytes(files)
+		for workers > 1 && readBuffer(pool, workers, len(files), dec, maxMatch, batch) < max(goodReadBuf, least) {
 			workers--
 		}
-		st.ReadBuffer = readBuffer(pool, workers, len(files), maxMatch, batch)
-		if st.ReadBuffer < minReadBuf {
-			return st, fmt.Errorf("%w: a Join of %d run files needs read buffers of %d bytes each, and may take %d bytes",
-				mem.ErrExhausted, len(files), minReadBuf, readBudget(pool, 1, maxMatch, batch))
+		st.ReadBuffer = readBuffer(pool, workers, len(files), dec, maxMatch, batch)
+		if st.ReadBuffer < least {
+			return st, fmt.Errorf("%w: a Join of %d run files needs read buffers of %d bytes each, and %d to decode them, and may take %d bytes",
+				mem.ErrExhausted, len(files), least, dec, readBudget(pool, 1, maxMatch, batch))
 		}
-		st.ReadBytes = int64(workers) * int64(len(files)) * int64(st.ReadBuffer)
+		st.ReadBytes = int64(workers) * (int64(len(files))*int64(st.ReadBuffer) + dec)
 		if err := reserve(st.ReadBytes); err != nil {
 			return st, err
 		}
@@ -338,6 +342,7 @@ func Run(ctx context.Context, pool *mem.Pool, fsys humus.FS, buf *buffer.Buffer,
 			maxMatch: maxMatch,
 			e:        newEmitter(pool, opts.Filter, batch, sends, batch),
 			save:     make([]int64, fan),
+			dec:      spill.NewDecoder(files),
 		}
 		w.drop.Store(drop && i == 0)
 		reserved -= batch // the emitter's to release
@@ -346,7 +351,7 @@ func Run(ctx context.Context, pool *mem.Pool, fsys humus.FS, buf *buffer.Buffer,
 			slab := make([]byte, len(files)*st.ReadBuffer)
 			for r := range files {
 				rb := slab[r*st.ReadBuffer : (r+1)*st.ReadBuffer : (r+1)*st.ReadBuffer]
-				c := spill.NewCursor(opened[r], uint64(r), rb, w.grow)
+				c := spill.NewFileCursor(opened[r], files[r], uint64(r), rb, w.grow, w.dec)
 				w.cursors = append(w.cursors, c)
 				srcs[r] = c
 			}
@@ -396,7 +401,9 @@ func Run(ctx context.Context, pool *mem.Pool, fsys humus.FS, buf *buffer.Buffer,
 		st.Streamed += w.streamed
 		for _, c := range w.cursors {
 			st.Reads += c.Reads()
+			st.BytesRead += c.BytesRead()
 		}
+		w.dec.Close()
 	}
 	if sched.err != nil {
 		return st, sched.err
@@ -469,6 +476,7 @@ type worker struct {
 	snap     *buffer.Snapshot
 	files    []*spill.File
 	cursors  []*spill.Cursor
+	dec      *spill.Decoder // of the cursors' blocks
 	m        *merge.Merger
 	e        *emitter
 	f        Filter

@@ -151,7 +151,7 @@ func TestRun_spills_past_the_budget_and_joins_like_the_oracle(t *testing.T) {
 	if got := runFileNames(t, r.dir); len(got) != len(r.buf.Files()) {
 		t.Errorf("%d files in the run's directory, the run has %d", len(got), len(r.buf.Files()))
 	}
-	if e.inUse() != int64(len(r.buf.Files()))*spill.FileBytes {
+	if e.inUse() != spill.FilesMem(r.buf.Files()) {
 		t.Errorf("a sealed run that spilled holds %d bytes, want its files' tables only", e.inUse())
 	}
 	got, err := joinRun(r)
@@ -700,6 +700,7 @@ func TestRun_property_tiny_budgets_spill_and_match_the_oracle(t *testing.T) {
 			MaxBuckets:       64,
 			OutputBatchBytes: batch,
 			JoinParallelism:  parallelism,
+			SpillCodec:       testCodec,
 		})
 		if err != nil {
 			rt.Fatal(err)
