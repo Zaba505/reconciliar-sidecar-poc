@@ -250,8 +250,9 @@ type Run struct {
 	diskBytes atomic.Int64 // of the run's files
 	seq       atomic.Int64 // of the next file
 	spills    atomic.Int64
-	// The records the run's spills wrote, and the bytes their files took.
-	spillRaw, spillBytes atomic.Int64
+	// The records the run's spills wrote, the bytes their files took, and
+	// the time the writes took, while the run's streams waited.
+	spillRaw, spillBytes, spillNanos atomic.Int64
 
 	deleteOnce sync.Once
 	deleteErr  error
@@ -378,6 +379,8 @@ func (r *Run) write(bytes int64, m *merge.Merger) (*spill.File, error) {
 	}
 	r.m.wmu.Lock()
 	defer r.m.wmu.Unlock()
+	start := time.Now()
+	defer func() { r.spillNanos.Add(int64(time.Since(start))) }()
 	w, err := spill.Create(r.m.fsys, r.path(), r.m.wbuf, r.m.enc)
 	if err != nil {
 		disk.Release(most)
@@ -597,6 +600,7 @@ func (r *Run) Seal() (*reconv1.SealRunResponse, error) {
 		"recon.spill_codec", r.m.format.Codec.String(),
 		"recon.spill_raw_bytes", r.spillRaw.Load(),
 		"recon.spill_file_bytes", r.spillBytes.Load(),
+		"recon.spill_seconds", time.Duration(r.spillNanos.Load()).Seconds(),
 		"recon.seal_seconds", time.Since(start).Seconds(),
 	)
 	r.state = Sealed
@@ -682,6 +686,7 @@ func (r *Run) Join(ctx context.Context, filter join.Filter, send func(*reconv1.J
 		"recon.join_tasks", stats.Tasks,
 		"recon.join_read_buffer_bytes", stats.ReadBuffer,
 		"recon.join_reads", stats.Reads,
+		"recon.join_bytes_read", stats.BytesRead,
 		"recon.join_batches", stats.Batches,
 		"recon.join_streamed_keys", stats.Streamed,
 		"recon.join_seconds", time.Since(start).Seconds(),
