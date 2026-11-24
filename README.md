@@ -42,7 +42,7 @@ flowchart TB
   Join == "results" ==> App
 ```
 
-Inside the join engine:
+Inside the join engine (step by step in [How a Join runs](#how-a-join-runs-step-by-step)):
 
 ```mermaid
 flowchart LR
@@ -141,6 +141,196 @@ A Join that fails, for example with `HOT_KEY` or a cancelled client, leaves the 
 - **Empty keys** hash to 0, sort first and never match one another. Each is a one-sided result.
 - **Output and backpressure.** Workers hand finished batches to a single sender, because gRPC allows one send at a time per stream. When your application reads slowly, gRPC flow control blocks the sender, which blocks the workers, so memory stays within budget. A batch's arena and structs are used again once it is sent.
 - **Control totals.** The engine counts every record it joined on each side, including results removed by the `states` filter. The stream ends `OK` only if those counts equal the totals returned by SealRun.
+
+### How records are laid out in memory and on disk
+
+Blocks exist only in memory. A spill doesn't write blocks out: it merges all of a run's blocks into one new run file, in the order a Join reads. A record is the same bytes in both places:
+
+```
+┌─────────┬───────────────────────┬──────────────┬───────┬─────────┐
+│ hash    │ uvarint               │ uvarint      │ key   │ value   │
+│ u64, LE │ key length × 2 + side │ value length │       │         │
+└─────────┴───────────────────────┴──────────────┴───────┴─────────┘
+  8 bytes   1 byte if the key is    1 byte if the value
+            under 64 bytes          is under 128 bytes
+```
+
+The hash is the key's XXH3, or 0 for an empty key. Its top byte is the record's **fence**, one of 256 equal ranges of the hash, which is how a Join divides its work.
+
+A block is one allocation of 1 MiB, or a 32nd of a small budget. Records fill it from the front, and a 16-byte sort entry per record fills it from the back, until the next record and its entry don't fit:
+
+```
+offset 0                                                           end of the block
+┌──────────────┬──────────────┬──────────────┬────────────┬───────┬───────┬───────┐
+│ record A     │ record B     │ record C     │            │ entry │ entry │ entry │
+│ hash c2…     │ hash 1a…     │ hash 3f…     │    free    │ → B   │ → C   │ → A   │
+└──────────────┴──────────────┴──────────────┴────────────┴───────┴───────┴───────┘
+ records, from the front:                                  sort entries, from the back:
+ copied once, in arrival order,                            {hash u64, offset u32,
+ never moved                                                ticket u32}, sorted in place
+```
+
+The goroutine that fills a block then sorts its entries in place, by (hash, key, side, ticket). Only the entries move: the drawing shows them sorted, pointing at B, C, A, the order the records will have on disk. The ticket is that of the Append section that copied the record, so a key's records on one side keep the order they were ingested in.
+
+A spill merges the sorted entries of all the run's blocks, and writes the records in that order:
+
+```mermaid
+flowchart LR
+  B0["Block 0<br/>sorted entries"] --> LT
+  B1["Block 1<br/>sorted entries"] --> LT
+  Bk["Block k<br/>sorted entries"] --> LT
+  LT["Loser tree<br/>(hash, key, side, ticket)"] -- "records, in order" --> WB["Write buffer<br/>1 MiB, aligned,<br/>one for every spill"]
+  WB -- "O_DIRECT writes<br/>of the whole buffer" --> F[("runs/#lt;id#gt;/000003.run<br/>records back to back:<br/>no header, no index")]
+  LT -. "the offset where<br/>each fence starts" .-> FT["Fence table, in memory<br/>257 offsets, about 2 KiB"]
+```
+
+- The loser tree compares the hashes held in the entries, and reads keys only when two hashes are equal.
+- A run file is written once, front to back, through the one aligned write buffer every spill shares. Every write but the last is the whole buffer. With `O_DIRECT` the last is padded to a 4 KiB page and the file cut back. Where the filesystem refuses `O_DIRECT`, the file is written through the page cache.
+- As records go by, the writer notes the offset at which each fence starts. That table of 257 offsets, the last of them the file's size, stays in memory with the run, and is the file's only index.
+- The emptied blocks go to the pool's idle list, still reserved, to take the next records.
+
+A Join's task is a range of fences, which it reads from every file. The fence tables give the range's bytes in each file, at its own offset in each:
+
+```
+task 3 is fences 64–95, a segment of every file:
+
+file 0    ├─ fences 0–63 ──┼▓▓ 64–95 ▓▓┼─────────── fences 96–255 ───────────┤
+file 1    ├── 0–63 ──┼▓ 64–95 ▓┼───────── 96–255 ────────┤
+file 2    ├─── fences 0–63 ────┼▓▓▓ 64–95 ▓▓▓┼─────────────── fences 96–255 ────────────────┤
+                               ▲             ▲
+                               Fences[64]    Fences[96] of file 2
+
+one worker on task 3, with a cursor per file:
+
+file 0, Fences[64] to Fences[96]  ── pread ──►  read buffer 0  ──┐
+file 1, Fences[64] to Fences[96]  ── pread ──►  read buffer 1  ──┼──►  loser tree  ──►  emitter
+file 2, Fences[64] to Fences[96]  ── pread ──►  read buffer 2  ──┘
+```
+
+- Each worker has its own cursor and read buffer for each file. The files are opened once and shared, because `pread` doesn't move a file's offset.
+- A cursor reads its segment front to back, a buffer at a time, ending each read on a 4 KiB page where it can, so that no page is read twice. The kernel's readahead is off (`FADV_RANDOM`), since the buffers ask for exactly what the merge needs. Each byte of a file is read once per Join.
+- Read buffers are as large as the budget allows, up to 256 KiB, in 4 KiB steps. Below 32 KiB the Join runs fewer workers instead.
+- A record larger than its cursor's read buffer is not read whole. The cursor holds its header and key, and its value stays on disk until the worker needs it for a result, when one `pread` reads it straight into the worker's arena.
+- A run that never spilled is joined from its sorted blocks instead. A binary search of a block's entries finds the task's fences, and the merge reads the records where they lie.
+
+### How a Join runs, step by step
+
+#### The merge, by example
+
+Every source is sorted, so the loser tree's output is too, in (hash, key, side, ord) order. A file's ord is its place in the run, and every record in a file was ingested before every record in a later one. So a key's left records come first, in ingest order, then its right ones. Here are three files of a run, with made-up hashes of which only the top byte is shown:
+
+```
+ file 0                    file 1                    file 2
+┌───────────────────┐     ┌───────────────────┐     ┌───────────────────┐
+│ 1a inv-42 left  a │     │ 1a inv-42 right b │     │ 1a inv-42 left  c │
+│ 3f inv-07 right d │     │ 8c inv-19 left  e │     │ c2 inv-55 right g │
+│ c2 inv-55 left  f │     └─────────┬─────────┘     └─────────┬─────────┘
+└─────────┬─────────┘               │                         │
+          └─────────────────────────┼─────────────────────────┘
+                                    ▼
+               loser tree, in (hash, key, side, ord) order
+```
+
+The worker takes the merged records one at a time, and holds at most one key's:
+
+| Merged record | From | What the worker does | Result |
+|---|---|---|---|
+| `1a inv-42 left a` | file 0 | A new key, and a left record: starts a group, holds `a` | |
+| `1a inv-42 left c` | file 2 | The same key: holds `c` | |
+| `1a inv-42 right b` | file 1 | The same key, and a right record, so the group is a `Match`: holds `b` | |
+| `3f inv-07 right d` | file 0 | A new key: ends the `inv-42` group | `both`: `inv-42`, left `[a, c]`, right `[b]` |
+| | | A right record with no left record before it | `right_only`: `inv-07`, `d` |
+| `8c inv-19 left e` | file 1 | A new key, and a left record: starts a group, holds `e` | |
+| `c2 inv-55 left f` | file 0 | A new key: ends the `inv-19` group, which had no right record | `left_only`: `inv-19`, `e` |
+| | | Starts a group, holds `f` | |
+| `c2 inv-55 right g` | file 2 | The same key, and a right record: holds `g` | |
+| (end of the task) | | Ends the `inv-55` group | `both`: `inv-55`, left `[f]`, right `[g]` |
+
+#### What a worker does with each record
+
+The example takes the common path. Every record goes through these checks, which also cover empty and hot keys:
+
+```mermaid
+flowchart TB
+  N["The merge's next record"] --> E{"Empty key?"}
+  E -- yes --> One["A one-sided result:<br/>left_only or right_only"]
+  E -- no --> S{"Same key as<br/>the group held?"}
+  S -- no --> Fin["End the group held:<br/>both sides → one both result, a Match<br/>left only → a left_only result per value"]
+  Fin --> R{"A right record?"}
+  R -- "yes: the key has<br/>no left records" --> One
+  R -- no --> Start["Start a group for the key,<br/>and hold the value"]
+  S -- yes --> L{"Would the group pass<br/>RECON_MAX_MATCH_BYTES,<br/>or take twice that in memory?"}
+  L -- no --> Hold["Hold the value"]
+  L -- yes --> Scan["Scan to the end of the key without holding it,<br/>counting each side, then rewind the cursors"]
+  Scan --> Any{"Any right<br/>records?"}
+  Any -- "yes, and the Match is<br/>over the limit" --> Hot(["HOT_KEY: the Join fails"])
+  Any -- "yes, within the limit:<br/>many tiny values" --> Hold
+  Any -- no --> Stream["Emit the values held as left_only,<br/>then stream the rest of the key,<br/>a left_only result per record"]
+```
+
+#### How the workers run at once
+
+```mermaid
+flowchart LR
+  Plan["Plan<br/>256 fences → tasks<br/>of about equal bytes,<br/>8 per worker"] --> Sched["Schedule<br/>hands out tasks<br/>in plan order"]
+  Files[("Run files<br/>opened once, shared")]
+  subgraph Workers["Workers, at most RECON_JOIN_PARALLELISM"]
+    direction TB
+    W1["Worker 1<br/>a cursor per file → loser tree → emitter"]
+    W2["Worker 2<br/>the same, on its own task"]
+    WN["Worker N"]
+  end
+  Sched -- "next task" --> Workers
+  Files -- "pread: the task's<br/>segment of every file" --> Workers
+  Workers -- "a batch" --> Ch{{"Unbuffered<br/>channel"}}
+  Ch --> Sender["Sender<br/>the Join's goroutine,<br/>one SendMsg at a time"]
+  Sender -- "JoinResponse" --> App(["Your application"])
+  Sender -. "sent: the worker reuses<br/>the batch's memory" .-> Workers
+```
+
+- The plan has eight tasks per worker, so a worker held up by a slow task leaves the rest to the others. A worker takes the next task in plan order as soon as it finishes one.
+- Each worker merges with its own cursors, loser tree and emitter. What the workers share, the open files and the pinned run, they only read.
+- A worker sends a batch when it fills, and at the end of every task. So a task's batches depend only on the data and the plan, not on which worker took it, though batches of different tasks interleave on the stream.
+- A worker hands a batch to the sender over an unbuffered channel, and waits for the send before it reuses the batch's memory. So each worker has at most one batch in flight, and a client that reads slowly stops the workers instead of letting batches pile up.
+- When a task fails, with `HOT_KEY` say, no further task starts and the tasks after it in the plan are cancelled, while those before it run on. The Join returns the error of the first failed task in plan order, so the error doesn't depend on which worker got there first.
+
+#### A Join over time
+
+With two workers the plan has 16 tasks, of about 16 fences each when the hashes spread evenly:
+
+```mermaid
+sequenceDiagram
+  participant W1 as Worker 1
+  participant W2 as Worker 2
+  participant Q as Schedule
+  participant S as Sender
+  participant App as Your application
+
+  W1->>Q: take a task
+  Q-->>W1: task 0: fences 0–15
+  W2->>Q: take a task
+  Q-->>W2: task 1: fences 16–31
+  Note over W1,W2: both merge at once, each<br/>its task's segment of every file
+  W1->>S: a full batch
+  Note over W1: waits until it is sent
+  S->>App: JoinResponse
+  Note over S,App: a slow reader blocks SendMsg,<br/>and so every waiting worker
+  Note over W2: task 1 is done: its last<br/>batch waits for the sender
+  S-->>W1: sent
+  Note over W1: reuses the batch's<br/>memory, merges on
+  W2->>S: task 1's last batch
+  S->>App: JoinResponse
+  S-->>W2: sent
+  W2->>Q: take a task
+  Q-->>W2: task 2: fences 32–47
+  Note over W1,App: … until no task is left
+  W1->>Q: take a task
+  Q-->>W1: none left
+  W2->>Q: take a task
+  Q-->>W2: none left
+  Note over S: every worker has ended:<br/>the channel closes, and each<br/>side's count must equal<br/>its Seal total
+  S-->>App: the stream ends OK
+```
 
 ### Memory and spilling
 
