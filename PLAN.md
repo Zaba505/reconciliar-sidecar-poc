@@ -35,7 +35,7 @@ Most of these follow from humus's design; the rest keep the POC small.
 | — | New `RECON_TLS_CERT_FILE` and `RECON_TLS_KEY_FILE`, both required | `grpcserver.Settings.TLS` has no default |
 | Prometheus `/metrics` on `RECON_METRICS_ADDR` (§14) | OpenTelemetry metrics on the humus `Setup`'s `MeterProvider`, exported as `none`, `console` or `otlp` | humus's telemetry package has no Prometheus exporter |
 | DuckDB oracle driven from Python (§17) | A naive full outer join in Go, test-only | Keeps a single toolchain. DuckDB can be added later. |
-| LZ4/ZSTD blocks in run files (§8.3) | Uncompressed records | The codec is chosen by benchmark in M3 |
+| LZ4/ZSTD blocks in run files (§8.3) | Uncompressed records by default; s2 or zstd blocks with `RECON_SPILL_CODEC`, a prototype | The codec is chosen by benchmark in M3. [SPILL_COMPRESSION.md](SPILL_COMPRESSION.md) measures the prototype |
 | `GOMEMLIMIT` required for a garbage-collected implementation (§11) | Not set by the sidecar; the deployment sets it | The measurements (§8.5) show it is needed at the default budget. Setting it from the cgroup limit is a small change the POC leaves out. |
 
 Everything else (states, errors, limits, run IDs, the file layout and the join algorithm) follows the proposal as written.
