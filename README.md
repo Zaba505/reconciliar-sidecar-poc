@@ -274,7 +274,7 @@ flowchart TB
 flowchart LR
   Plan["Plan<br/>256 fences → tasks<br/>of about equal bytes,<br/>8 per worker"] --> Sched["Schedule<br/>hands out tasks<br/>in plan order"]
   Files[("Run files<br/>opened once, shared")]
-  subgraph Workers["Workers, at most RECON_JOIN_PARALLELISM"]
+  subgraph Workers["Worker goroutines, running at once, at most RECON_JOIN_PARALLELISM"]
     direction TB
     W1["Worker 1<br/>a cursor per file → loser tree → emitter"]
     W2["Worker 2<br/>the same, on its own task"]
@@ -296,41 +296,34 @@ flowchart LR
 
 #### A Join over time
 
-With two workers the plan has 16 tasks, of about 16 fences each when the hashes spread evenly:
+Each worker is its own goroutine, and the workers merge at the same time. A worker's merge reads its own cursors and builds results in its own arena. It touches nothing another worker writes, apart from an occasional reservation from the pool. Workers wait on each other in only two places: taking the next task, a moment under the schedule's mutex, and handing a batch to the sender, which sends one at a time.
+
+Here are two workers, whose plan has 16 tasks. Time runs left to right, in made-up units, and red is a worker waiting:
 
 ```mermaid
-sequenceDiagram
-  participant W1 as Worker 1
-  participant W2 as Worker 2
-  participant Q as Schedule
-  participant S as Sender
-  participant App as Your application
-
-  W1->>Q: take a task
-  Q-->>W1: task 0: fences 0–15
-  W2->>Q: take a task
-  Q-->>W2: task 1: fences 16–31
-  Note over W1,W2: both merge at once, each<br/>its task's segment of every file
-  W1->>S: a full batch
-  Note over W1: waits until it is sent
-  S->>App: JoinResponse
-  Note over S,App: a slow reader blocks SendMsg,<br/>and so every waiting worker
-  Note over W2: task 1 is done: its last<br/>batch waits for the sender
-  S-->>W1: sent
-  Note over W1: reuses the batch's<br/>memory, merges on
-  W2->>S: task 1's last batch
-  S->>App: JoinResponse
-  S-->>W2: sent
-  W2->>Q: take a task
-  Q-->>W2: task 2: fences 32–47
-  Note over W1,App: … until no task is left
-  W1->>Q: take a task
-  Q-->>W1: none left
-  W2->>Q: take a task
-  Q-->>W2: none left
-  Note over S: every worker has ended:<br/>the channel closes, and each<br/>side's count must equal<br/>its Seal total
-  S-->>App: the stream ends OK
+gantt
+  dateFormat X
+  axisFormat %S
+  section Worker 1
+  merge task 0              : a1, 0, 12s
+  wait for its send         : crit, a2, after a1, 2s
+  merge task 0, on          : a3, after a2, 8s
+  wait for its send         : crit, a4, after a3, 2s
+  merge task 3              : a5, after a4, 8s
+  section Worker 2
+  merge task 1              : b1, 0, 13s
+  wait for the sender       : crit, b2, after b1, 3s
+  merge task 2              : b3, after b2, 16s
+  section Sender
+  send worker 1's batch     : active, c1, after a1, 2s
+  send worker 2's batch     : active, c2, after c1, 2s
+  send worker 1's batch     : active, c3, after a3, 2s
 ```
+
+- The workers merge at the same time for most of the Join. Worker 2 ends task 1 while the sender is still sending worker 1's batch, so it waits for that send to finish, then for its own.
+- After its send, worker 1 goes on with task 0. Worker 2's send ended task 1, so it takes the next task in the plan, task 2, and worker 1 takes task 3 once task 0 is done.
+- A client that reads slowly makes every send longer. The red bars grow until the workers spend most of their time waiting, which is the backpressure that keeps a Join within its memory.
+- Once every worker has ended, the Join checks each side's count against its Seal total and ends the stream.
 
 ### Memory and spilling
 
