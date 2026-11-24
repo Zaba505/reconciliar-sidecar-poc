@@ -251,7 +251,7 @@ flowchart TB
   Ok -- no --> Fail(["MEMORY_EXHAUSTED"])
 ```
 
-- The read budget is what the pool has free once the workers' largest Matches and an eighth of the budget are set aside, but never less than a quarter of the budget or more than half.
+- The read budget is what the pool has free, less an allowance per worker and an eighth of the budget, but never less than a quarter of the budget or more than half. A worker's allowance is room for its largest `Match`, twice `RECON_MAX_MATCH_BYTES`, and for its output batch, twice `RECON_OUTPUT_BATCH_BYTES`: about 8 MiB at the defaults. The pool counts as free what it could reclaim by dropping idle blocks or spilling runs no Join has pinned, so other runs' records in memory don't shrink the read budget: they are spilled to make room for the read buffers.
 - A run that never spilled has no files, so its workers need no read buffers.
 - The plan depends only on the bytes per fence and the workers wanted, so the same run under the same settings always gets the same tasks. Fewer workers may run them, when other runs hold memory, but the tasks stay the same.
 
