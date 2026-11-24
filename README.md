@@ -215,6 +215,46 @@ file 2, Fences[64] to Fences[96]  ── pread ──►  read buffer 2  ──�
 
 ### How a Join runs, step by step
 
+#### Planning the tasks
+
+A Join first cuts the run's 256 fences into tasks, each a range of fences in hash order. All of a key's records share its hash, so they lie in one fence and so in one task: a task is a full outer join of its own keys, and needs nothing from any other task.
+
+The plan takes the bytes each fence holds, and cuts the fences in order wherever the running total first reaches the next equal share of the whole. Here 16 fences are cut into 4 tasks, where a real plan cuts 256 fences into 8 tasks per worker:
+
+```
+fence         0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15
+MiB           3   4   6   1  12   2   5   4   7   2   3   4   6   3   2   4   total 68
+so far        3   7  13  14  26  28  33  37  44  46  49  53  59  62  64  68
+                              ▲ ≥ 17      ▲ ≥ 34          ▲ ≥ 51
+            └───── task 0 ─────┘└─ task 1 ─┘└─── task 2 ───┘└─── task 3 ───┘
+                   26 MiB          11 MiB        16 MiB          15 MiB
+```
+
+- A fence is never split, so a task can run over its share, as task 0 does with fence 4's 12 MiB. The cuts follow the running total, not each task's size, so the task after one that ran over is shorter.
+- When the hashes spread evenly, every fence holds about the same, and the default 4 workers get 32 tasks of about 8 fences each. A key that holds more than a task's share makes its task larger than the rest, however the fences are cut.
+
+How many tasks and workers there are, and how large their read buffers, comes from the budget:
+
+```mermaid
+flowchart TB
+  FT["Each file's fence table:<br/>the bytes of each fence"] --> Sum["Bytes per fence:<br/>256 numbers"]
+  BL["Blocks still in memory:<br/>record sizes by fence"] --> Sum
+  P["RECON_JOIN_PARALLELISM"] --> Want["Workers wanted:<br/>fewer if their batches<br/>and largest Matches would<br/>take over ¾ of the budget"]
+  Sum --> Cut["Cut the fences in order<br/>into tasks of about<br/>equal bytes, 8 per<br/>worker wanted"]
+  Want --> Cut
+  Cut --> W["Workers: as many<br/>as wanted, at most<br/>one per task"]
+  W --> RB["Read buffer =<br/>read budget ÷<br/>(workers × files)"]
+  RB --> Small{"Under 32 KiB,<br/>with more than<br/>one worker?"}
+  Small -- yes --> Fewer["One worker fewer"] --> RB
+  Small -- no --> Ok{"At least<br/>4 KiB?"}
+  Ok -- yes --> Go(["Each worker gets a<br/>read buffer per file,<br/>at most 256 KiB"])
+  Ok -- no --> Fail(["MEMORY_EXHAUSTED"])
+```
+
+- The read budget is what the pool has free once the workers' largest Matches and an eighth of the budget are set aside, but never less than a quarter of the budget or more than half.
+- A run that never spilled has no files, so its workers need no read buffers.
+- The plan depends only on the bytes per fence and the workers wanted, so the same run under the same settings always gets the same tasks. Fewer workers may run them, when other runs hold memory, but the tasks stay the same.
+
 #### The merge, by example
 
 Every source is sorted, so the loser tree's output is too, in (hash, key, side, ord) order. A file's ord is its place in the run, and every record in a file was ingested before every record in a later one. So a key's left records come first, in ingest order, then its right ones. Here are three files of a run, with made-up hashes of which only the top byte is shown:
