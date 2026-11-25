@@ -81,7 +81,7 @@ The 300-per-second rate is one user's report, so the last column is arithmetic, 
    - One pass over 500 GiB takes about 68 minutes at gp3's 125 MiB/s baseline.
    - It takes about 110 minutes at the 81.25 MB/s that a small EC2 node sustains once its burst is spent.
    - Re-partitioning or an intermediate merge adds a whole pass. Sorted runs with one file per run needs neither.
-   - Spill compression, which the README measures at 1.8 times with zstd, cuts every pass by the same factor.
+   - Spill compression, which the README measures at 1.8 times with zstd, cuts every pass by the same factor, if it compresses as fast as the disk writes. The prototype in [SPILL_COMPRESSION.md](SPILL_COMPRESSION.md) cuts a Join's pass at 125 MiB/s by 1.5 times with s2 and 1.7 times with zstd, but zstd compresses on one core at about the disk's speed, so it doesn't yet shorten the spills.
 2. **Keep requests at 256 KiB or more in both directions.**
    - **Writes:** sorted runs averaged about 1 MB per write call at 10 GiB (10,734 calls). The current design averaged about 14 KiB (768,760 calls) and the patched design about 12 KiB (914,278 calls), scattered across thousands of files.
    - **Join reads:** the prototype gives up workers only when read buffers would fall below 32 KiB. At 3,000 IOPS a 32 KiB read caps at about 94 MiB/s. On network volumes the floor should be near 256 KiB, accepting fewer workers.

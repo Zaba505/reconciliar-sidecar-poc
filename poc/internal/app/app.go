@@ -53,6 +53,7 @@ func initWith(ctx context.Context, s *humus.Setup, cgroupFile string) ([]humus.S
 		OutputBatchBytes: cfg.OutputBatchBytes,
 		JoinParallelism:  cfg.JoinParallelism,
 		MaxMatchBytes:    cfg.MaxMatchBytes,
+		SpillCodec:       cfg.SpillCodec,
 		Logger:           log,
 	})
 	if err != nil {
@@ -80,6 +81,7 @@ func initWith(ctx context.Context, s *humus.Setup, cgroupFile string) ([]humus.S
 		"recon.max_recv_message_bytes", cfg.MaxRecvMessageBytes,
 		"recon.output_batch_bytes", cfg.OutputBatchBytes,
 		"recon.max_match_bytes", cfg.MaxMatchBytes,
+		"recon.spill_codec", cfg.SpillCodec.String(),
 	)
 	return []humus.Service{svc, probes}, nil
 }

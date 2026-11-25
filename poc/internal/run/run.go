@@ -74,6 +74,7 @@ type Config struct {
 	OutputBatchBytes int64
 	JoinParallelism  int
 	MaxMatchBytes    int64        // 0 means a worker's share of the budget
+	SpillCodec       spill.Codec  // of run files' blocks; None writes no blocks
 	Logger           *slog.Logger // nil discards
 }
 
@@ -85,11 +86,14 @@ type Manager struct {
 	cfg  Config
 	log  *slog.Logger
 
-	// wbuf is the write buffer of every spill, reserved for the Manager's
-	// life. The pool spills one run at a time, and Seal spills through it
-	// too, so wmu is rarely waited for. Nothing reserves while holding it.
+	// wbuf is the write buffer of every spill, and enc its encoder,
+	// reserved for the Manager's life. The pool spills one run at a time,
+	// and Seal spills through it too, so wmu is rarely waited for. Nothing
+	// reserves while holding it.
 	wmu      sync.Mutex
 	wbuf     []byte
+	format   spill.Format
+	enc      *spill.Encoder
 	reserved int64
 
 	mu   sync.Mutex
@@ -99,18 +103,20 @@ type Manager struct {
 // NewManager returns a Manager whose runs reserve memory from pool and
 // keep their files in cfg.DataDir/runs on fsys, spilled through disk. It
 // makes pool spill the runs' buffers. It fails if pool can't hold the
-// write buffer.
+// write buffer and its encoder.
 func NewManager(fsys humus.FS, pool *mem.Pool, disk *spill.Disk, cfg Config) (*Manager, error) {
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	size := buffer.BlockSize(pool.Limit()) &^ (spill.Align - 1)
-	reserved := int64(size) + spill.Align
+	format := spill.FormatFor(cfg.SpillCodec, pool.Limit())
+	reserved := int64(size) + spill.Align + format.EncoderBytes()
 	if err := pool.Reserve(reserved); err != nil {
 		return nil, fmt.Errorf("reserve the spill write buffer: %w", err)
 	}
-	m := &Manager{fsys: fsys, pool: pool, disk: disk, cfg: cfg, log: log, wbuf: spill.AlignedBuffer(size), reserved: reserved, runs: map[string]*Run{}}
+	m := &Manager{fsys: fsys, pool: pool, disk: disk, cfg: cfg, log: log, wbuf: spill.AlignedBuffer(size),
+		format: format, enc: spill.NewEncoder(format), reserved: reserved, runs: map[string]*Run{}}
 	pool.SetSource(m.spillable)
 	return m, nil
 }
@@ -244,6 +250,9 @@ type Run struct {
 	diskBytes atomic.Int64 // of the run's files
 	seq       atomic.Int64 // of the next file
 	spills    atomic.Int64
+	// The records the run's spills wrote, the bytes their files took, and
+	// the time the writes took, while the run's streams waited.
+	spillRaw, spillBytes, spillNanos atomic.Int64
 
 	deleteOnce sync.Once
 	deleteErr  error
@@ -360,31 +369,38 @@ func (r *Run) path() string {
 }
 
 // write writes a spill of bytes bytes, the records of m, through the
-// Manager's write buffer. r.files is held for reading.
+// Manager's write buffer. It reserves the most the file may take on disk,
+// and keeps what it takes. r.files is held for reading.
 func (r *Run) write(bytes int64, m *merge.Merger) (*spill.File, error) {
 	disk := r.m.disk
-	if err := disk.Reserve(bytes); err != nil {
+	most := r.m.format.MaxBytes(bytes)
+	if err := disk.Reserve(most); err != nil {
 		return nil, err
 	}
 	r.m.wmu.Lock()
 	defer r.m.wmu.Unlock()
-	w, err := spill.Create(r.m.fsys, r.path(), r.m.wbuf)
+	start := time.Now()
+	defer func() { r.spillNanos.Add(int64(time.Since(start))) }()
+	w, err := spill.Create(r.m.fsys, r.path(), r.m.wbuf, r.m.enc)
 	if err != nil {
-		disk.Release(bytes)
+		disk.Release(most)
 		return nil, err
 	}
 	if err := spill.Copy(context.Background(), w, m); err != nil {
 		w.Abort()
-		disk.Release(bytes)
+		disk.Release(most)
 		return nil, err
 	}
 	f, err := w.Finish()
 	if err != nil {
-		disk.Release(bytes)
+		disk.Release(most)
 		return nil, err
 	}
-	r.diskBytes.Add(bytes)
+	disk.Release(most - f.Bytes)
+	r.diskBytes.Add(f.Bytes)
 	r.spills.Add(1)
+	r.spillRaw.Add(f.Raw)
+	r.spillBytes.Add(f.Bytes)
 	return f, nil
 }
 
@@ -392,12 +408,14 @@ func (r *Run) write(bytes int64, m *merge.Merger) (*spill.File, error) {
 // for reading while it is used.
 type runFiles struct{ r *Run }
 
-func (f runFiles) Create(bytes int64, buf []byte) (*spill.Writer, error) {
+func (f runFiles) Format() spill.Format { return f.r.m.format }
+
+func (f runFiles) Create(bytes int64, buf []byte, enc *spill.Encoder) (*spill.Writer, error) {
 	r := f.r
 	if err := r.m.disk.Reserve(bytes); err != nil {
 		return nil, err
 	}
-	w, err := spill.Create(r.m.fsys, r.path(), buf)
+	w, err := spill.Create(r.m.fsys, r.path(), buf, enc)
 	if err != nil {
 		r.m.disk.Release(bytes)
 		return nil, err
@@ -579,6 +597,10 @@ func (r *Run) Seal() (*reconv1.SealRunResponse, error) {
 		"recon.merges", merged.Merges,
 		"recon.merge_bytes", merged.Bytes,
 		"recon.merges_skipped", merged.Skipped,
+		"recon.spill_codec", r.m.format.Codec.String(),
+		"recon.spill_raw_bytes", r.spillRaw.Load(),
+		"recon.spill_file_bytes", r.spillBytes.Load(),
+		"recon.spill_seconds", time.Duration(r.spillNanos.Load()).Seconds(),
 		"recon.seal_seconds", time.Since(start).Seconds(),
 	)
 	r.state = Sealed
@@ -664,6 +686,7 @@ func (r *Run) Join(ctx context.Context, filter join.Filter, send func(*reconv1.J
 		"recon.join_tasks", stats.Tasks,
 		"recon.join_read_buffer_bytes", stats.ReadBuffer,
 		"recon.join_reads", stats.Reads,
+		"recon.join_bytes_read", stats.BytesRead,
 		"recon.join_batches", stats.Batches,
 		"recon.join_streamed_keys", stats.Streamed,
 		"recon.join_seconds", time.Since(start).Seconds(),

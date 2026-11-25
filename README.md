@@ -57,7 +57,7 @@ flowchart LR
 | Block memtable | `internal/buffer` | Copies each record once into a 1 MiB block: records from the front, a 16-byte sort entry (hash, offset, ingest ticket) from the back. The goroutine that fills a block sorts its entries. A spill merges every block of the run into one file |
 | Merge | `internal/merge` | A loser tree over sorted sources, in (hash, key, side, ingest) order |
 | Memory pool | `internal/mem` | Holds the single memory budget. Every block, decoded message, read buffer, arena and output batch reserves before it allocates. Blocks a spill empties stay reserved as idle buffers for the next records, until a reservation needs the room. When a reservation doesn't fit, the goroutine asking for memory drops idle buffers, then spills the largest unpinned runs to 80% of the budget, and retries once. There is no background work |
-| Run files | `internal/spill` | Writes sorted run files with direct I/O through an aligned buffer, keeps each file's table of fences, reads segments of them with `pread` through cursors that leave large values on disk until they are emitted, tracks them against `RECON_DISK_LIMIT_BYTES`, and empties the data directory at startup |
+| Run files | `internal/spill` | Writes sorted run files with direct I/O through an aligned buffer, optionally in compressed blocks, keeps each file's table of fences, reads segments of them with `pread` through cursors that leave large values on disk until they are emitted, tracks them against `RECON_DISK_LIMIT_BYTES`, and empties the data directory at startup |
 | Join engine | `internal/join` | Plans fences into tasks, merges each task's segment of every file and block on a worker, emits results through an arena of chunks and a single sender, checks control totals, and merges files at Seal when there are too many |
 | Health | `grpchealth` (humus) | Serves `grpc.health.v1` in plaintext on `:8081` for the startup and readiness probes |
 
@@ -188,6 +188,7 @@ flowchart LR
 - A run file is written once, front to back, through the one aligned write buffer every spill shares. Every write but the last is the whole buffer. With `O_DIRECT` the last is padded to a 4 KiB page and the file cut back. Where the filesystem refuses `O_DIRECT`, the file is written through the page cache.
 - As records go by, the writer notes the offset at which each fence starts. That table of 257 offsets, the last of them the file's size, stays in memory with the run, and is the file's only index.
 - The emptied blocks go to the pool's idle list, still reserved, to take the next records.
+- With `RECON_SPILL_CODEC` set to `s2` or `zstd`, the writer puts the records in blocks of up to 32 KiB, each compressed on its own, and a fence starts a block. A record larger than a block is stored as it is, in a block of its own. The fence table then holds block offsets, so a Join still finds its segments, and a large value is still read with one `pread`. A cursor decodes a block at a time into its read buffer. See [SPILL_COMPRESSION.md](SPILL_COMPRESSION.md) for the format and what it costs.
 
 A Join's task is a range of fences, which it reads from every file. The fence tables give the range's bytes in each file, at its own offset in each:
 
@@ -444,7 +445,7 @@ poc/               Go module "poc"
   internal/record/     the record encoding, hashes and fences
   internal/buffer/     a run's blocks and sorted run files
   internal/merge/      the loser-tree merge
-  internal/spill/      run file writer and cursor, disk accounting, startup wipe
+  internal/spill/      run file writer and cursor, compressed blocks, disk accounting, startup wipe
   internal/join/       plan, merge workers, emitter, hot keys, merge at Seal
   internal/oracle/     naive full outer join used by tests
   gen/recon/v1/        generated gRPC code (committed)
@@ -508,6 +509,7 @@ The sidecar is configured through environment variables. A bad value stops it at
 | `RECON_MAX_RECV_MESSAGE_BYTES` | `16MiB` | Largest Ingest message |
 | `RECON_OUTPUT_BATCH_BYTES` | `1MiB` | Join output batch size |
 | `RECON_MAX_MATCH_BYTES` | `3MiB` | Largest single `Match` before `HOT_KEY`. A one-sided key has no limit |
+| `RECON_SPILL_CODEC` | `none` | Compression of run files: `none`, `s2` or `zstd`. A prototype; `zstd` needs a budget of at least 8 MiB. See [SPILL_COMPRESSION.md](SPILL_COMPRESSION.md) |
 | `RECON_LOG_KEYS` | `false` | Include keys in logs and `HOT_KEY` errors |
 | `RECON_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. Logs go to stdout as JSON. |
 | `RECON_METRICS_EXPORTER` | `none` | `none`, `console` or `otlp` (OpenTelemetry) |
@@ -587,7 +589,7 @@ In a real pipeline, reading the source can overlap with Ingest, and processing r
 
 ## Known limitations
 
-- **Spill compression is not implemented.** The proposal chooses the codec by benchmark in a later milestone. Run files are large sequential blocks, which suit it.
+- **Spill compression is a prototype, off by default.** `RECON_SPILL_CODEC=s2` makes files about two thirds the size of their records, and Joins on a 125 MiB/s volume about 1.5 times faster, but it compresses on the spill's goroutine, while the run's streams wait. See [SPILL_COMPRESSION.md](SPILL_COMPRESSION.md).
 - **The join slows when data far outgrows the budget.** Read buffers shrink, then workers are given up, then Seal merges files. Read-ahead on the cursor that runs dry first is the known remedy, and isn't built.
 - **A spill stalls every stream of its run.** A spill is one write of about the budget: about 0.2 s on NVMe, about 1 s at 125 MiB/s. An overlapped or half-budget spill would hide it, and isn't built.
 - **Joins of different runs share one pool.** Each sizes its read buffers from what the pool has free, so Joins at once read with smaller buffers, and can still fail with `MEMORY_EXHAUSTED` under a small budget. That is retryable, and the run stays `SEALED`.
@@ -597,4 +599,4 @@ In a real pipeline, reading the source can overlap with Ingest, and processing r
 
 ## Deviations from the proposal
 
-These are listed in [PLAN.md §2](PLAN.md#2-deviations-from-the-proposal). In short: the API uses TCP with TLS instead of a Unix socket, metrics go to OpenTelemetry instead of Prometheus, the test oracle is in Go instead of DuckDB, and spill blocks are uncompressed.
+These are listed in [PLAN.md §2](PLAN.md#2-deviations-from-the-proposal). In short: the API uses TCP with TLS instead of a Unix socket, metrics go to OpenTelemetry instead of Prometheus, the test oracle is in Go instead of DuckDB, and spill compression is a prototype, off by default.

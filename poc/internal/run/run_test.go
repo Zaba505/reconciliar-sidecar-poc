@@ -1,6 +1,7 @@
 package run
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -35,6 +36,17 @@ func newEnv(t *testing.T, limit int64) *env {
 	return newEnvWithDisk(t, limit, 1<<30)
 }
 
+// testCodec is the codec the tests' Managers spill with:
+// RECON_TEST_SPILL_CODEC's, so that the package's tests can run on files
+// of blocks, or none.
+var testCodec = func() spill.Codec {
+	c, err := spill.ParseCodec(cmp.Or(os.Getenv("RECON_TEST_SPILL_CODEC"), "none"))
+	if err != nil {
+		panic(err)
+	}
+	return c
+}()
+
 func newEnvWithDisk(t *testing.T, limit, diskLimit int64) *env {
 	t.Helper()
 	h := humustest.NewHost(t, humustest.WithFiles(map[string][]byte{"data/.keep": nil}))
@@ -46,6 +58,7 @@ func newEnvWithDisk(t *testing.T, limit, diskLimit int64) *env {
 		MaxBuckets:       64,
 		OutputBatchBytes: 4096,
 		JoinParallelism:  2,
+		SpillCodec:       testCodec,
 	})
 	if err != nil {
 		t.Fatal(err)
