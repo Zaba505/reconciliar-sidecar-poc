@@ -9,7 +9,7 @@
 - **Spills pay on the stall path.** A spill compresses on its one goroutine, and the run's streams wait for it. s2 adds about 3.4 s of CPU per 2 GiB, and zstd about 13.6 s: zstd compresses at 110 to 155 MiB/s on one core here, about as fast as a gp3 volume writes. On a fast disk, s2 makes spills 1.7 times slower, and zstd 3.7 times.
 - **Seeking still works.** Each fence starts a block, so the fence table locates every Join task's segment. A cursor's position names a block and an offset in it, so a hot key's rewind decodes at most the blocks it went back over. A record larger than a block is stored raw, so its value is read with one `pread`, or skipped.
 
-**Recommendation.** Use s2 on network block storage (EBS, Persistent Disk, Hyperdisk) and keep `none` on local NVMe. zstd's ratio is better, but it needs compression off the stall path before it pays: in parallel with the merge, on several cores. That isn't built.
+**Recommendation.** Use s2 on network block storage (EBS, Persistent Disk, Hyperdisk) and keep `none` on local NVMe. zstd's ratio is better, but it needs compression off the stall path before it pays: in parallel with the merge, on several cores. That isn't built; [Compressing off the stall path](#compressing-off-the-stall-path) estimates what it would buy and cost.
 
 ## The format
 
@@ -130,9 +130,63 @@ Envelope records, which hold ciphertext, as protobuf (1,042 MiB of records), and
 - **Ciphertext saves 12%,** whether with s2 or zstd. Most likely that is the keys, key IDs and lengths around the ciphertext, which doesn't compress. It is just past the sixteenth a block must save to be stored compressed, so these blocks are decoded for little.
 - **JSON is where compression pays most:** s2's Join at 125 MiB/s takes 2.5 times less time, and its spill at least 1.6 times less.
 
+## Compressing off the stall path
+
+A spill now runs on one goroutine, and the run's streams wait for all of it:
+
+```
+merge the next records → fill a block → compress it → copy it into the write buffer → O_DIRECT write → …
+```
+
+So a spill takes the merge's time, plus the compression's, plus the write's. The merge has to stay on one goroutine, since it produces one sorted stream. Compression doesn't: each block is compressed on its own, with nothing carried from one block to the next. A spill could be a pipeline:
+
+```
+merge goroutine ──raw blocks──► N compressor goroutines ──compressed blocks──► writer goroutine
+  one sorted stream               in any order                                  in the blocks' order
+```
+
+The merge hands each full block on and goes on merging, the compressors work at once, and the writer writes the blocks in order. A spill then takes about as long as its slowest stage.
+
+### What it would buy
+
+These are estimates, not measurements. They take each stage's cost from the 2 GiB tables above:
+
+- the merge: 5.4 s, the uncompressed spill on tmpfs;
+- compression: 3.4 s with s2 and 13.6 s with zstd on one core, shared by 4 compressors;
+- the write: the file's bytes at 125 MiB/s, or nothing extra on the fast disk, which didn't slow the uncompressed spill.
+
+They assume the stages overlap fully. On 4 cores the merge takes one, so the compressors get about 3. zstd's compression then takes about 4.5 s, which is still shorter than the merge.
+
+| Codec | Disk | Now | Pipelined, estimated | Slowest stage |
+|---|---|---|---|---|
+| none | 125 MiB/s | 22.5 s, serial model | 17.1 s | the write |
+| s2 | 125 MiB/s | 20.2 s, serial model | 11.4 s | the write |
+| zstd | 125 MiB/s | 28.8 s, serial model | 9.8 s | the write |
+| none | fast disk | 5.4 s, measured | 5.4 s | the merge |
+| s2 | fast disk | 9.2 s, measured | about 5.4 s | the merge |
+| zstd | fast disk | 19.9 s, measured | about 5.4 s | the merge |
+
+On a slow disk, zstd's spill would then be the shortest, since it writes the fewest bytes. On a fast disk, compression would cost the run's streams almost no time. So this change, more than the codec, decides whether zstd is worth its CPU.
+
+### What it would cost
+
+- **CPU.** The streams wait less, but the CPU does the same work: 13.6 s per 2 GiB with zstd, and 3.4 s with s2. That CPU is shared with decoding Ingest messages and with other runs' Joins. While a run spills its own streams wait, so some cores are idle, but other runs' aren't.
+- **Memory, reserved for the Manager's life.** A spill runs inside the pool's `Reserve`, so it can't reserve anything itself. The pipeline's memory would have to be held from the start, as the write buffer is:
+  - each block in flight needs its records and its compressed bytes, about 70 KiB at 32 KiB blocks;
+  - each compressor needs an encoder: nothing for s2, about 384 KiB for zstd.
+
+  With 4 compressors and 8 blocks in flight, that is about 0.6 MiB with s2 and 2 MiB with zstd. That is little against 128 MiB, but too much for small budgets, which would run fewer compressors or none.
+- **The fence table, filled in later.** The writer now records a fence's file offset when the fence's first record arrives, which works because every earlier block has been written by then. In a pipeline, the merge would record that fence i starts at block k, and the writer would fill in the offset when it writes block k.
+- **Order and back-pressure.** Compressors finish out of order. The writer holds finished blocks until the next one in order arrives, and the merge waits for a free block, so the blocks in flight bound the memory.
+- **Failure.** A failed write must stop the merge and the compressors, and `Abort` must wait for them before it removes the file.
+
+### Writes in flight too
+
+The same writer goroutine could keep more than one write in flight. [SPILL_STORAGE_RESEARCH.md](SPILL_STORAGE_RESEARCH.md) notes that a gp3 volume needs about three requests outstanding to reach its baseline, and a spill now issues one at a time. Two or three 1 MiB write buffers, each reserved, would cover it, with or without compression.
+
 ## What isn't built
 
-- **Compression off the stall path.** A spill could merge into blocks on its goroutine and compress them on others, writing them in order, so that the stall is the longest of the merge, compression on several cores, and the write. That would make zstd's spill about as fast as s2's, and is the change that decides between them.
+- **Compression off the stall path,** as described above. It is the change that decides between s2 and zstd.
 - **Choosing per spill.** A spill whose first blocks don't compress could stop compressing, so that data like Envelope's costs nothing.
 - **A real network volume.** These measurements throttle a local disk. A volume's latency per request, and its burst credits, aren't modelled. See [SPILL_STORAGE_RESEARCH.md](SPILL_STORAGE_RESEARCH.md).
 - **The e2e suite on blocks.** The unit tests of `internal/join` and `internal/run` run on files of any codec with `RECON_TEST_SPILL_CODEC=s2` or `zstd`. The container suite and its RESULT records don't set a codec yet.
